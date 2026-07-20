@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pomodorough</string>
+    <string name="timer_complete_channel">Timer arrivals</string>
+    <string name="timer_complete_title">Service complete</string>
+</resources>
