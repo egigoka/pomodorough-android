@@ -7,6 +7,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import me.egigoka.pomodorough.data.CanonicalTimer
+import me.egigoka.pomodorough.data.BootstrapResolutionRequest
 import me.egigoka.pomodorough.data.CommandType
 import me.egigoka.pomodorough.data.DurationOperation
 import me.egigoka.pomodorough.data.DurationsMs
@@ -29,6 +30,7 @@ import me.egigoka.pomodorough.data.local.LocalStateEntity
 import me.egigoka.pomodorough.data.local.TimerDao
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
+import okhttp3.Request
 
 internal val repositoryJson = Json {
     ignoreUnknownKeys = true
@@ -38,10 +40,15 @@ internal val repositoryJson = Json {
 internal class TestAuthSession(
     var tokensAvailable: Boolean = false,
 ) : AuthSession {
+    var signInCalls = 0
+    var signInHandler: (suspend (Activity, String) -> TokenPair)? = null
     var logoutCalls = 0
     var logoutFailure: Throwable? = null
 
-    override suspend fun signIn(activity: Activity, deviceId: String): TokenPair = error("Unused")
+    override suspend fun signIn(activity: Activity, deviceId: String): TokenPair {
+        signInCalls += 1
+        return signInHandler?.invoke(activity, deviceId) ?: error("Unused")
+    }
     override fun hasTokens(): Boolean = tokensAvailable
     override suspend fun <T> authorized(block: suspend (String) -> T): T = block("access-token")
 
@@ -60,9 +67,20 @@ internal class TestRepositoryService(
     var profile: User = testUser(),
 ) : PomodoroughService {
     var syncCalls = 0
+    var bootstrapCalls = 0
+    var resolveCalls = 0
+    var revisionStreamCalls = 0
+    var revisionStreamCancelCalls = 0
     val syncRequests = mutableListOf<SyncRequest>()
+    val resolutionRequests = mutableListOf<BootstrapResolutionRequest>()
+    val callOrder = mutableListOf<String>()
     var meFailure: Throwable? = null
+    var bootstrapFailure: Throwable? = null
+    var bootstrapHandler: (suspend () -> SyncResponse)? = null
+    var resolveFailure: Throwable? = null
     var syncFailure: Throwable? = null
+    var bootstrapResponse: SyncResponse? = null
+    var resolveHandler: (suspend (BootstrapResolutionRequest) -> SyncResponse)? = null
     var syncHandler: (suspend (SyncRequest) -> SyncResponse)? = null
     var syncResponse = SyncResponse(
         acknowledgements = emptyList(),
@@ -79,11 +97,36 @@ internal class TestRepositoryService(
     )
 
     override suspend fun me(accessToken: String): MeResponse {
+        callOrder += "me"
         meFailure?.let { throw it }
         return MeResponse(profile, "csrf-token")
     }
 
+    override suspend fun bootstrap(accessToken: String): SyncResponse {
+        callOrder += "bootstrap"
+        bootstrapCalls += 1
+        bootstrapFailure?.let { throw it }
+        bootstrapHandler?.let { return it() }
+        return bootstrapResponse ?: syncResponse.copy(
+            acknowledgements = emptyList(),
+            durationAcknowledgements = emptyList(),
+            taskAcknowledgements = emptyList(),
+        )
+    }
+
+    override suspend fun resolveBootstrap(
+        accessToken: String,
+        request: BootstrapResolutionRequest,
+    ): SyncResponse {
+        callOrder += "resolve"
+        resolveCalls += 1
+        resolutionRequests += request
+        resolveFailure?.let { throw it }
+        return resolveHandler?.invoke(request) ?: syncResponse
+    }
+
     override suspend fun sync(accessToken: String, request: SyncRequest): SyncResponse {
+        callOrder += "sync"
         syncCalls += 1
         syncRequests += request
         syncFailure?.let { throw it }
@@ -94,8 +137,18 @@ internal class TestRepositoryService(
     override suspend fun exchange(request: NativeExchangeRequest): TokenPair = error("Unused")
     override suspend fun refresh(refreshToken: String): TokenPair = error("Unused")
     override suspend fun logout(accessToken: String) = Unit
-    override fun revisionStream(accessToken: String, listener: EventSourceListener): EventSource =
-        error("Unused")
+    override fun revisionStream(accessToken: String, listener: EventSourceListener): EventSource {
+        revisionStreamCalls += 1
+        return object : EventSource {
+            override fun request(): Request = Request.Builder()
+                .url("https://example.test/api/v1/stream")
+                .build()
+
+            override fun cancel() {
+                revisionStreamCancelCalls += 1
+            }
+        }
+    }
 }
 
 internal fun testRepository(

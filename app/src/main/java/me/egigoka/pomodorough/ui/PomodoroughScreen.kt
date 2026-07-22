@@ -79,9 +79,11 @@ import kotlin.math.sin
 import kotlinx.coroutines.delay
 import me.egigoka.pomodorough.data.AppState
 import me.egigoka.pomodorough.data.AuthStatus
+import me.egigoka.pomodorough.data.BootstrapStrategy
 import me.egigoka.pomodorough.data.CanonicalTimer
 import me.egigoka.pomodorough.data.FocusTask
 import me.egigoka.pomodorough.data.HistoryItem
+import me.egigoka.pomodorough.data.ResolutionRecovery
 import me.egigoka.pomodorough.data.TaskDailySummary
 import me.egigoka.pomodorough.data.SyncStatus
 import me.egigoka.pomodorough.data.TimerPhase
@@ -104,20 +106,20 @@ fun PomodoroughScreen(
     onSelectTask: (String?) -> Unit,
     onAddTask: (String) -> Unit,
     onDeleteTask: (String) -> Unit,
+    onResolveHistory: (BootstrapStrategy) -> Unit,
+    onRecoverHistoryResolution: () -> Unit,
+    onConfirmAccountSwitch: () -> Unit,
+    onCancelAccountSwitch: () -> Unit,
     onDismissConflict: () -> Unit,
     onDismissNotice: () -> Unit,
 ) {
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-        when (state.authStatus) {
-            AuthStatus.Loading -> LoadingScreen()
-            AuthStatus.SignedOut, AuthStatus.SigningIn -> SignInScreen(
-                signingIn = state.authStatus == AuthStatus.SigningIn,
-                notice = state.notice,
-                onSignIn = onSignIn,
-                onDismissNotice = onDismissNotice,
-            )
-            AuthStatus.SignedIn -> TimerScreen(
+        if (!state.ready) {
+            LoadingScreen()
+        } else {
+            TimerScreen(
                 state = state,
+                onSignIn = onSignIn,
                 onLogout = onLogout,
                 onToggleTimer = onToggleTimer,
                 onFinishTimer = onFinishTimer,
@@ -129,6 +131,10 @@ fun PomodoroughScreen(
                 onSelectTask = onSelectTask,
                 onAddTask = onAddTask,
                 onDeleteTask = onDeleteTask,
+                onResolveHistory = onResolveHistory,
+                onRecoverHistoryResolution = onRecoverHistoryResolution,
+                onConfirmAccountSwitch = onConfirmAccountSwitch,
+                onCancelAccountSwitch = onCancelAccountSwitch,
                 onDismissConflict = onDismissConflict,
                 onDismissNotice = onDismissNotice,
             )
@@ -258,6 +264,7 @@ private fun SignInScreen(
 @Composable
 private fun TimerScreen(
     state: AppState,
+    onSignIn: () -> Unit,
     onLogout: () -> Unit,
     onToggleTimer: () -> Unit,
     onFinishTimer: () -> Unit,
@@ -269,11 +276,24 @@ private fun TimerScreen(
     onSelectTask: (String?) -> Unit,
     onAddTask: (String) -> Unit,
     onDeleteTask: (String) -> Unit,
+    onResolveHistory: (BootstrapStrategy) -> Unit,
+    onRecoverHistoryResolution: () -> Unit,
+    onConfirmAccountSwitch: () -> Unit,
+    onCancelAccountSwitch: () -> Unit,
     onDismissConflict: () -> Unit,
     onDismissNotice: () -> Unit,
 ) {
     var showLogoutDialog by remember { mutableStateOf(false) }
+    var confirmationStrategy by remember(
+        state.historyResolution?.requestId,
+        state.historyResolution?.pendingStrategy,
+        state.historyResolution?.recovery,
+    ) { mutableStateOf<BootstrapStrategy?>(null) }
     var activeScreen by remember { mutableStateOf(SignedInScreen.Timer) }
+    val mutationsEnabled = state.authStatus != AuthStatus.Loading &&
+        state.authStatus != AuthStatus.SigningIn &&
+        state.historyResolution == null &&
+        state.accountSwitch == null
     val completedHistory = remember(state.history) {
         state.history
             .filter { it.status == TimerStatus.Completed }
@@ -293,7 +313,11 @@ private fun TimerScreen(
         contentPadding = PaddingValues(bottom = 20.dp),
     ) {
         item {
-            AppHeader(state = state, onLogout = { showLogoutDialog = true })
+            AppHeader(
+                state = state,
+                onSignIn = onSignIn,
+                onLogout = { showLogoutDialog = true },
+            )
         }
         item {
             ScreenSwitcher(
@@ -333,7 +357,7 @@ private fun TimerScreen(
                     taskTitle = state.timer?.taskId?.let { taskId ->
                         state.knownTasks.firstOrNull { it.id == taskId }?.title
                     },
-                    ready = state.ready,
+                    ready = state.ready && mutationsEnabled,
                     onToggleTimer = onToggleTimer,
                     onFinishTimer = onFinishTimer,
                     onCancelTimer = onCancelTimer,
@@ -344,11 +368,13 @@ private fun TimerScreen(
                     selectedTaskId = state.selectedTaskId,
                     timer = state.timer,
                     selectedPhase = state.settings.selectedPhase,
+                    mutationsEnabled = mutationsEnabled,
                     onSelectTask = onSelectTask,
                 )
                 PatternSection(
                     settings = state.settings,
                     timer = state.timer,
+                    mutationsEnabled = mutationsEnabled,
                     onSelectPhase = onSelectPhase,
                     onChangeDuration = onChangeDuration,
                     onSetAutoStart = onSetAutoStart,
@@ -388,6 +414,7 @@ private fun TimerScreen(
             item {
                 TaskBoardHeader(
                     summaries = state.taskSummaries,
+                    mutationsEnabled = mutationsEnabled,
                     onAddTask = onAddTask,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
                 )
@@ -416,6 +443,7 @@ private fun TimerScreen(
                 items(state.taskSummaries, key = { it.task.id }) { summary ->
                     TaskSummaryRow(
                         summary = summary,
+                        mutationsEnabled = mutationsEnabled,
                         onDelete = { onDeleteTask(summary.task.id) },
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 5.dp),
                     )
@@ -425,12 +453,13 @@ private fun TimerScreen(
         item {
             Footer(
                 deviceId = state.deviceId,
+                signedIn = state.authStatus == AuthStatus.SignedIn,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 22.dp),
             )
         }
     }
 
-    if (showLogoutDialog) {
+    if (showLogoutDialog && state.authStatus == AuthStatus.SignedIn) {
         AlertDialog(
             onDismissRequest = { showLogoutDialog = false },
             shape = MaterialTheme.shapes.extraLarge,
@@ -459,10 +488,174 @@ private fun TimerScreen(
             },
         )
     }
+
+    state.accountSwitch?.let { accountSwitch ->
+        AlertDialog(
+            onDismissRequest = {},
+            shape = MaterialTheme.shapes.extraLarge,
+            containerColor = Cloud,
+            title = { Text("Different account detected") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "Local data belongs to ${accountSwitch.localAccount}, but ${accountSwitch.incomingAccount} is signed in. Switching accounts permanently removes this device's timer, history, tasks, and unsynced operations.",
+                    )
+                    accountSwitch.error?.let { Text(it, color = Danger, fontWeight = FontWeight.Bold) }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = onConfirmAccountSwitch,
+                    enabled = !accountSwitch.submitting,
+                ) { Text("Switch and remove local data", color = Danger, fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = onCancelAccountSwitch,
+                    enabled = !accountSwitch.submitting,
+                ) { Text("Keep local data") }
+            },
+        )
+    }
+
+    state.historyResolution?.let { resolution ->
+        val selected = resolution.pendingStrategy ?: confirmationStrategy
+        val confirmingKeepRemoteRecovery = resolution.corrupted &&
+            resolution.recovery == ResolutionRecovery.KeepRemote &&
+            selected == BootstrapStrategy.KeepRemote
+        AlertDialog(
+            onDismissRequest = {
+                if (resolution.pendingStrategy == null && !resolution.submitting) {
+                    confirmationStrategy = null
+                }
+            },
+            shape = MaterialTheme.shapes.extraLarge,
+            containerColor = Cloud,
+            title = {
+                Text(
+                    when {
+                        confirmingKeepRemoteRecovery -> "Confirm Keep Remote"
+                        resolution.recovery == ResolutionRecovery.KeepRemote -> "Local changes cannot be submitted"
+                        resolution.corrupted -> "Saved history choice is corrupted"
+                        resolution.submitting -> "Applying history choice"
+                        resolution.pendingStrategy != null -> "Retry history choice"
+                        selected != null -> "Confirm ${resolutionLabel(selected)}"
+                        else -> "Choose your history"
+                    },
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        if (confirmingKeepRemoteRecovery) {
+                            resolutionWarning(BootstrapStrategy.KeepRemote)
+                        } else if (resolution.recovery == ResolutionRecovery.KeepRemote) {
+                            "Local queues exceed the safe request limit or contain invalid saved data. Keep Remote is available, but it will discard those queues only after the server confirms."
+                        } else if (resolution.corrupted) {
+                            "Discard only the corrupted saved request, then fetch account history again. Local timer, history, tasks, settings, and queued operations stay on this device."
+                        } else if (selected == null) {
+                            "This device and your account both have completed sessions. Choose how to continue before making more changes."
+                        } else {
+                            resolutionWarning(selected)
+                        },
+                    )
+                    resolution.error?.let { Text(it, color = Danger, fontWeight = FontWeight.Bold) }
+                    if (resolution.pendingStrategy != null) {
+                        Text("Retry sends the exact saved request ID and operation payload.")
+                    }
+                }
+            },
+            confirmButton = {
+                if (resolution.corrupted && !confirmingKeepRemoteRecovery) {
+                    when (resolution.recovery) {
+                        ResolutionRecovery.KeepRemote -> TextButton(
+                            onClick = { confirmationStrategy = BootstrapStrategy.KeepRemote },
+                            enabled = !resolution.submitting,
+                        ) { Text("Review Keep Remote", fontWeight = FontWeight.Bold) }
+                        ResolutionRecovery.Repreview -> TextButton(
+                            onClick = {
+                                if (state.authStatus == AuthStatus.SignedIn) {
+                                    onRecoverHistoryResolution()
+                                } else {
+                                    onSignIn()
+                                }
+                            },
+                            enabled = !resolution.submitting &&
+                                (state.authStatus == AuthStatus.SignedIn ||
+                                    state.authStatus == AuthStatus.SignedOut),
+                        ) {
+                            Text(
+                                when (state.authStatus) {
+                                    AuthStatus.SignedOut -> "Sign in to re-check"
+                                    AuthStatus.SigningIn -> "Signing in..."
+                                    AuthStatus.Loading -> "Checking account..."
+                                    AuthStatus.SignedIn -> "Discard request and re-check"
+                                },
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                        null -> Unit
+                    }
+                } else if (selected == null) {
+                    Column(horizontalAlignment = Alignment.End) {
+                        TextButton(onClick = { confirmationStrategy = BootstrapStrategy.ReplaceRemote }) {
+                            Text("Keep Local")
+                        }
+                        TextButton(onClick = { confirmationStrategy = BootstrapStrategy.KeepRemote }) {
+                            Text("Keep Remote")
+                        }
+                        TextButton(onClick = { confirmationStrategy = BootstrapStrategy.Merge }) {
+                            Text("Keep Both")
+                        }
+                    }
+                } else {
+                    TextButton(
+                        onClick = {
+                            if (state.authStatus == AuthStatus.SignedIn) {
+                                onResolveHistory(selected)
+                            } else {
+                                onSignIn()
+                            }
+                        },
+                        enabled = !resolution.submitting &&
+                            (state.authStatus == AuthStatus.SignedIn || state.authStatus == AuthStatus.SignedOut),
+                    ) {
+                        Text(
+                            when {
+                                state.authStatus == AuthStatus.SignedOut -> "Sign in to retry"
+                                state.authStatus == AuthStatus.SigningIn -> "Signing in to retry..."
+                                state.authStatus == AuthStatus.Loading -> "Checking account..."
+                                resolution.pendingStrategy != null -> "Retry"
+                                else -> "Confirm ${resolutionLabel(selected)}"
+                            },
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                }
+            },
+            dismissButton = if (
+                selected != null &&
+                resolution.pendingStrategy == null &&
+                (!resolution.corrupted || confirmingKeepRemoteRecovery)
+            ) {
+                {
+                    TextButton(
+                        onClick = { confirmationStrategy = null },
+                        enabled = !resolution.submitting,
+                        modifier = Modifier.semantics {
+                            contentDescription = "Cancel history choice"
+                        },
+                    ) { Text("Cancel") }
+                }
+            } else {
+                null
+            },
+        )
+    }
 }
 
 @Composable
-private fun AppHeader(state: AppState, onLogout: () -> Unit) {
+private fun AppHeader(state: AppState, onSignIn: () -> Unit, onLogout: () -> Unit) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         color = Ink,
@@ -476,7 +669,20 @@ private fun AppHeader(state: AppState, onLogout: () -> Unit) {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 BrandMark(compact = true)
-                TextButton(onClick = onLogout) { Text("Log out", color = Lavender) }
+                when (state.authStatus) {
+                    AuthStatus.SignedIn -> TextButton(onClick = onLogout) {
+                        Text("Log out", color = Lavender)
+                    }
+                    AuthStatus.SigningIn -> TextButton(onClick = {}, enabled = false) {
+                        Text("Signing in...", color = Lavender)
+                    }
+                    AuthStatus.Loading -> TextButton(onClick = {}, enabled = false) {
+                        Text("Checking...", color = Lavender)
+                    }
+                    AuthStatus.SignedOut -> TextButton(onClick = onSignIn) {
+                        Text("Sign in", color = Butter, fontWeight = FontWeight.Bold)
+                    }
+                }
             }
             Spacer(Modifier.height(18.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -496,7 +702,11 @@ private fun AppHeader(state: AppState, onLogout: () -> Unit) {
                 }
                 Spacer(Modifier.width(12.dp))
                 Text(
-                    text = state.user?.name?.ifBlank { state.user.email } ?: "Signed in",
+                    text = when (state.authStatus) {
+                        AuthStatus.SignedIn -> state.user?.name?.ifBlank { state.user.email } ?: "Signed in"
+                        AuthStatus.Loading -> "Checking account"
+                        else -> "Saved on this device"
+                    },
                     modifier = Modifier.weight(1f),
                     color = Color.White,
                     style = MaterialTheme.typography.bodyMedium,
@@ -542,11 +752,12 @@ private fun TaskSelector(
     selectedTaskId: String?,
     timer: CanonicalTimer?,
     selectedPhase: String,
+    mutationsEnabled: Boolean,
     onSelectTask: (String?) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
     val active = timer?.status == TimerStatus.Running || timer?.status == TimerStatus.Paused
-    val enabled = !active && selectedPhase == TimerPhase.Focus
+    val enabled = mutationsEnabled && !active && selectedPhase == TimerPhase.Focus
     val selectedTitle = tasks.firstOrNull { it.id == selectedTaskId }?.title ?: "No task"
 
     Surface(color = Mint, contentColor = Ink, shape = MaterialTheme.shapes.large) {
@@ -608,6 +819,7 @@ private fun TaskSelector(
 @Composable
 private fun TaskBoardHeader(
     summaries: List<TaskDailySummary>,
+    mutationsEnabled: Boolean,
     onAddTask: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -633,6 +845,7 @@ private fun TaskBoardHeader(
                     label = { Text("Task") },
                     placeholder = { Text("Write release notes") },
                     singleLine = true,
+                    enabled = mutationsEnabled,
                 )
                 Spacer(Modifier.height(10.dp))
                 Button(
@@ -642,6 +855,7 @@ private fun TaskBoardHeader(
                             draft = ""
                         }
                     },
+                    enabled = mutationsEnabled,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(52.dp),
@@ -680,6 +894,7 @@ private fun TaskColumnLabels(modifier: Modifier = Modifier) {
 @Composable
 private fun TaskSummaryRow(
     summary: TaskDailySummary,
+    mutationsEnabled: Boolean,
     onDelete: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -715,7 +930,11 @@ private fun TaskSummaryRow(
                 style = MaterialTheme.typography.labelLarge,
                 textAlign = TextAlign.Center,
             )
-            TextButton(onClick = onDelete, modifier = Modifier.weight(0.9f)) {
+            TextButton(
+                onClick = onDelete,
+                enabled = mutationsEnabled,
+                modifier = Modifier.weight(0.9f),
+            ) {
                 Text("Delete", color = Danger)
             }
         }
@@ -952,6 +1171,7 @@ private fun TimerOrbit(timer: CanonicalTimer?, settings: TimerSettings, palette:
 private fun PatternSection(
     settings: TimerSettings,
     timer: CanonicalTimer?,
+    mutationsEnabled: Boolean,
     onSelectPhase: (String) -> Unit,
     onChangeDuration: (String, Int) -> Unit,
     onSetAutoStart: (Boolean) -> Unit,
@@ -971,7 +1191,7 @@ private fun PatternSection(
             phase = TimerPhase.Focus,
             supportingText = "Deep work",
             settings = settings,
-            enabled = !active,
+            enabled = mutationsEnabled && !active,
             onSelect = onSelectPhase,
             onChangeDuration = onChangeDuration,
         )
@@ -980,7 +1200,7 @@ private fun PatternSection(
             phase = TimerPhase.ShortBreak,
             supportingText = "Quick reset",
             settings = settings,
-            enabled = !active,
+            enabled = mutationsEnabled && !active,
             onSelect = onSelectPhase,
             onChangeDuration = onChangeDuration,
         )
@@ -989,7 +1209,7 @@ private fun PatternSection(
             phase = TimerPhase.LongBreak,
             supportingText = "Full recharge",
             settings = settings,
-            enabled = !active,
+            enabled = mutationsEnabled && !active,
             onSelect = onSelectPhase,
             onChangeDuration = onChangeDuration,
         )
@@ -1008,7 +1228,11 @@ private fun PatternSection(
                     )
                 }
                 Spacer(Modifier.width(12.dp))
-                Switch(checked = settings.autoStartBreaks, onCheckedChange = onSetAutoStart)
+                Switch(
+                    checked = settings.autoStartBreaks,
+                    onCheckedChange = onSetAutoStart,
+                    enabled = mutationsEnabled,
+                )
             }
         }
     }
@@ -1190,13 +1414,17 @@ private fun NoticeCard(message: String, onDismiss: () -> Unit, modifier: Modifie
 }
 
 @Composable
-private fun Footer(deviceId: String, modifier: Modifier = Modifier) {
+private fun Footer(deviceId: String, signedIn: Boolean, modifier: Modifier = Modifier) {
     Row(
         modifier = modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text("Local clock · shared account", color = MutedInk, style = MaterialTheme.typography.labelMedium)
+        Text(
+            if (signedIn) "Local clock · shared account" else "Local clock · sign in to sync",
+            color = MutedInk,
+            style = MaterialTheme.typography.labelMedium,
+        )
         Text("${deviceId.takeLast(4).uppercase()}", color = Violet, style = MaterialTheme.typography.labelMedium)
     }
 }
@@ -1250,14 +1478,43 @@ private fun phasePalette(phase: String): PhasePalette = when (phase) {
     else -> PhasePalette(container = Butter, accent = Tomato)
 }
 
-private fun syncLabel(state: AppState): String = when (state.syncStatus) {
-    SyncStatus.Offline -> if (state.pendingCount > 0) "Offline · ${state.pendingCount} queued" else "Offline · local"
-    SyncStatus.Conflict -> if (state.pendingCount > 0) "Conflict · ${state.pendingCount} queued" else "Conflict"
-    SyncStatus.Syncing -> "Syncing"
-    SyncStatus.Retrying -> if (state.pendingCount > 0) "Retrying · ${state.pendingCount} queued" else "Retrying sync"
-    SyncStatus.Queued -> "${state.pendingCount} waiting to sync"
-    SyncStatus.Checking -> "Checking sync"
-    SyncStatus.Synced -> "In sync"
+private fun syncLabel(state: AppState): String {
+    if (state.historyResolution != null) return "History choice needed"
+    if (state.authStatus != AuthStatus.SignedIn) {
+        return when (state.authStatus) {
+            AuthStatus.Loading -> "Checking account"
+            AuthStatus.SigningIn -> "Signing in"
+            else -> if (state.pendingCount > 0) {
+                "Local · ${state.pendingCount} saved"
+            } else {
+                "Local only"
+            }
+        }
+    }
+    return when (state.syncStatus) {
+        SyncStatus.Offline -> if (state.pendingCount > 0) "Offline · ${state.pendingCount} queued" else "Offline · local"
+        SyncStatus.Conflict -> if (state.pendingCount > 0) "Conflict · ${state.pendingCount} queued" else "Conflict"
+        SyncStatus.Syncing -> "Syncing"
+        SyncStatus.Retrying -> if (state.pendingCount > 0) "Retrying · ${state.pendingCount} queued" else "Retrying sync"
+        SyncStatus.Queued -> "${state.pendingCount} waiting to sync"
+        SyncStatus.Checking -> "Checking sync"
+        SyncStatus.Synced -> "In sync"
+    }
+}
+
+private fun resolutionLabel(strategy: BootstrapStrategy): String = when (strategy) {
+    BootstrapStrategy.ReplaceRemote -> "Keep Local"
+    BootstrapStrategy.KeepRemote -> "Keep Remote"
+    BootstrapStrategy.Merge -> "Keep Both"
+}
+
+private fun resolutionWarning(strategy: BootstrapStrategy): String = when (strategy) {
+    BootstrapStrategy.ReplaceRemote ->
+        "Remote account history will be replaced by this device's local history. This cannot be undone."
+    BootstrapStrategy.KeepRemote ->
+        "Local history and unsynced operations will be removed, then remote account history will be installed. This cannot be undone."
+    BootstrapStrategy.Merge ->
+        "Local and remote operations will be combined. Conflicting operations may be ignored or rejected, and errors are possible."
 }
 
 private fun syncColor(status: SyncStatus): Color = when (status) {

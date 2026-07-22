@@ -1,0 +1,226 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  JAVA_VERSION: "17"
+  ANDROID_API_LEVEL: "35"
+  ANDROID_BUILD_TOOLS_VERSION: "35.0.0"
+  TZ: Etc/UTC
+
+jobs:
+  validate-release:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag, version name, and version code
+        shell: bash
+        run: |
+          set -euo pipefail
+          semver_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [[ "${GITHUB_REF_NAME}" != v* ]] || [[ ! "${tag_version}" =~ ${semver_pattern} ]]; then
+            echo "Release tag must use vMAJOR.MINOR.PATCH format" >&2
+            exit 1
+          fi
+
+          version_name="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' app/build.gradle.kts)"
+          version_code="$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' app/build.gradle.kts)"
+          if [[ "${version_name}" != "${tag_version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match versionName ${version_name}" >&2
+            exit 1
+          fi
+          if [[ ! "${version_code}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "versionCode must be a positive integer" >&2
+            exit 1
+          fi
+
+          previous_tags=()
+          while IFS= read -r candidate; do
+            if [[ "${candidate}" == "${GITHUB_REF_NAME}" ]]; then
+              continue
+            fi
+            candidate_version="${candidate#v}"
+            if [[ ! "${candidate_version}" =~ ${semver_pattern} ]]; then
+              echo "Existing release tag ${candidate} is not strict SemVer" >&2
+              exit 1
+            fi
+            previous_tags+=("${candidate}")
+          done < <(git tag --list 'v*')
+
+          if (( ${#previous_tags[@]} > 0 )); then
+            highest_previous_version="$(
+              printf '%s\n' "${previous_tags[@]#v}" | sort -V | tail -n 1
+            )"
+            highest_version="$(
+              printf '%s\n' "${highest_previous_version}" "${tag_version}" | sort -V | tail -n 1
+            )"
+            if [[ "${highest_version}" != "${tag_version}" ]] ||
+              [[ "${highest_previous_version}" == "${tag_version}" ]]; then
+              echo "Release ${tag_version} must exceed existing ${highest_previous_version}" >&2
+              exit 1
+            fi
+
+            maximum_previous_code=0
+            maximum_previous_tag=""
+            for previous_tag in "${previous_tags[@]}"; do
+              previous_build="$(git show "${previous_tag}:app/build.gradle.kts")"
+              previous_code="$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' <<< "${previous_build}")"
+              if [[ ! "${previous_code}" =~ ^[1-9][0-9]*$ ]]; then
+                echo "${previous_tag} has invalid versionCode" >&2
+                exit 1
+              fi
+              if (( 10#${previous_code} > maximum_previous_code )); then
+                maximum_previous_code=$((10#${previous_code}))
+                maximum_previous_tag="${previous_tag}"
+              fi
+            done
+            if (( 10#${version_code} <= maximum_previous_code )); then
+              echo "versionCode ${version_code} must exceed ${maximum_previous_code} from ${maximum_previous_tag}" >&2
+              exit 1
+            fi
+          fi
+
+  verify-and-package:
+    name: Verify and package APKs
+    needs: validate-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and build tools
+        run: sdkmanager "platforms;android-${ANDROID_API_LEVEL}" "build-tools;${ANDROID_BUILD_TOOLS_VERSION}"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run unit tests, lint, and assemble APKs
+        run: >-
+          ./gradlew --no-daemon --stacktrace
+          :app:testDebugUnitTest
+          :app:lintDebug
+          :app:assembleDebug
+          :app:assembleRelease
+
+      - name: Package APKs and checksums
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk \
+            "dist/pomodorough-${GITHUB_REF_NAME}-debug.apk"
+          cp app/build/outputs/apk/release/app-release-unsigned.apk \
+            "dist/pomodorough-${GITHUB_REF_NAME}-release-unsigned.apk"
+          cd dist
+          sha256sum -- *.apk > SHA256SUMS.txt
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: pomodorough-android-${{ github.ref_name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  instrumented-tests:
+    name: Instrumented tests (API 35)
+    needs: validate-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and build tools
+        run: sdkmanager "platforms;android-${ANDROID_API_LEVEL}" "build-tools;${ANDROID_BUILD_TOOLS_VERSION}"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0660", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run connected instrumented tests
+        uses: ReactiveCircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          cores: 2
+          force-avd-creation: true
+          disable-animations: true
+          disable-spellchecker: true
+          emulator-boot-timeout: 1200
+          emulator-options: >-
+            -no-snapshot -no-window -gpu swiftshader_indirect -noaudio
+            -no-boot-anim -camera-back none -camera-front none -timezone Etc/UTC
+          script: ./gradlew --no-daemon --stacktrace :app:connectedDebugAndroidTest
+
+  release:
+    name: Create GitHub release
+    needs:
+      - verify-and-package
+      - instrumented-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: pomodorough-android-${{ github.ref_name }}
+          path: dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}" dist/*
+          --repo "${GITHUB_REPOSITORY}"
+          --verify-tag
+          --generate-notes
+          --title "Pomodorough Android ${GITHUB_REF_NAME}"
+          --notes "Artifacts are not production-signed.
+          pomodorough-${GITHUB_REF_NAME}-debug.apk uses an autogenerated debug key and is for testing only.
+          pomodorough-${GITHUB_REF_NAME}-release-unsigned.apk must be signed before installation or distribution.
+          Verify both APKs with SHA256SUMS.txt."

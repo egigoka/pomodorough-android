@@ -31,6 +31,9 @@ interface TimerDao {
     @Query("SELECT * FROM pending_duration_operations ORDER BY hlcWallMs, hlcCounter, id")
     suspend fun pendingDurationOperations(): List<PendingDurationOperationEntity>
 
+    @Query("SELECT * FROM pending_bootstrap_resolution WHERE id = 0")
+    suspend fun pendingBootstrapResolution(): PendingBootstrapResolutionEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertState(state: LocalStateEntity)
 
@@ -45,6 +48,9 @@ interface TimerDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertDurationOperation(operation: PendingDurationOperationEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertBootstrapResolution(resolution: PendingBootstrapResolutionEntity)
 
     @Delete
     suspend fun deleteCommands(commands: List<PendingCommandEntity>)
@@ -63,6 +69,9 @@ interface TimerDao {
 
     @Query("DELETE FROM pending_duration_operations")
     suspend fun deleteAllDurationOperations()
+
+    @Query("DELETE FROM pending_bootstrap_resolution")
+    suspend fun deleteBootstrapResolution()
 
     @Transaction
     suspend fun persistCommand(command: PendingCommandEntity, state: LocalStateEntity) {
@@ -117,6 +126,16 @@ interface TimerDao {
         deleteAllCommands()
         deleteAllTaskOperations()
         deleteAllDurationOperations()
+        deleteBootstrapResolution()
+        updateState(state)
+    }
+
+    @Transaction
+    suspend fun applyBootstrapResolution(state: LocalStateEntity) {
+        deleteAllCommands()
+        deleteAllTaskOperations()
+        deleteAllDurationOperations()
+        deleteBootstrapResolution()
         updateState(state)
     }
 }
@@ -127,8 +146,9 @@ interface TimerDao {
         PendingCommandEntity::class,
         PendingTaskOperationEntity::class,
         PendingDurationOperationEntity::class,
+        PendingBootstrapResolutionEntity::class,
     ],
-    version = 4,
+    version = 5,
     exportSchema = true,
 )
 abstract class PomodoroughDatabase : RoomDatabase() {
@@ -140,7 +160,7 @@ abstract class PomodoroughDatabase : RoomDatabase() {
                 context.applicationContext,
                 PomodoroughDatabase::class.java,
                 "pomodorough.db",
-            ).addMigrations(Migration1To2, Migration2To3, Migration3To4).build()
+            ).addMigrations(Migration1To2, Migration2To3, Migration3To4, Migration4To5).build()
 
         val Migration1To2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
@@ -217,6 +237,25 @@ abstract class PomodoroughDatabase : RoomDatabase() {
                         )
                     }
                 }
+            }
+        }
+
+        val Migration4To5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """CREATE TABLE IF NOT EXISTS pending_bootstrap_resolution (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        requestId TEXT NOT NULL,
+                        deviceId TEXT NOT NULL,
+                        expectedRevision INTEGER NOT NULL,
+                        strategy TEXT NOT NULL,
+                        commandsJson TEXT NOT NULL,
+                        taskOperationsJson TEXT NOT NULL,
+                        durationOperationsJson TEXT NOT NULL,
+                        ownerUserId TEXT NOT NULL,
+                        userJson TEXT NOT NULL
+                    )""".trimIndent(),
+                )
             }
         }
     }

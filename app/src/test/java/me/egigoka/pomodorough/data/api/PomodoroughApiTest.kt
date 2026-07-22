@@ -8,6 +8,8 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 import me.egigoka.pomodorough.data.DurationOperation
+import me.egigoka.pomodorough.data.BootstrapResolutionRequest
+import me.egigoka.pomodorough.data.BootstrapStrategy
 import me.egigoka.pomodorough.data.SyncRequest
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
@@ -83,6 +85,85 @@ class PomodoroughApiTest {
         assertTrue(body.contains("\"lastRevision\":7"))
         assertTrue(body.contains("\"commands\":[]"))
         assertTrue(body.contains("\"durationOperations\":[]"))
+    }
+
+    @Test
+    fun bootstrapIsReadOnlyAuthorizedGet() = runTest {
+        server.enqueue(jsonResponse(canonicalResponse(revision = 12)))
+
+        val response = api.bootstrap("access-token")
+        val request = server.takeRequest()
+
+        assertEquals(12L, response.revision)
+        assertTrue(response.acknowledgements.isEmpty())
+        assertEquals("GET", request.method)
+        assertEquals("/api/v1/bootstrap", request.path)
+        assertEquals("Bearer access-token", request.getHeader("Authorization"))
+        assertEquals(0L, request.bodySize)
+    }
+
+    @Test
+    fun bootstrapResolutionSendsExactRequiredEnvelope() = runTest {
+        server.enqueue(jsonResponse(canonicalResponse(revision = 13)))
+        val requestModel = BootstrapResolutionRequest(
+            requestId = "bootstrap-request-1",
+            deviceId = "device-1",
+            expectedRevision = 12,
+            strategy = BootstrapStrategy.Merge,
+            commands = emptyList(),
+            taskOperations = emptyList(),
+            durationOperations = emptyList(),
+        )
+
+        api.resolveBootstrap("access-token", requestModel)
+        val request = server.takeRequest()
+        val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+
+        assertEquals("POST", request.method)
+        assertEquals("/api/v1/bootstrap/resolve", request.path)
+        assertEquals(
+            setOf(
+                "requestId",
+                "deviceId",
+                "expectedRevision",
+                "strategy",
+                "commands",
+                "taskOperations",
+                "durationOperations",
+            ),
+            body.keys,
+        )
+        assertEquals("merge", body.getValue("strategy").jsonPrimitive.content)
+        assertTrue(body.getValue("commands").jsonArray.isEmpty())
+        assertTrue(body.getValue("taskOperations").jsonArray.isEmpty())
+        assertTrue(body.getValue("durationOperations").jsonArray.isEmpty())
+    }
+
+    @Test
+    fun bootstrapRevisionConflictHasStructuredType() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(409)
+                .setHeader("Content-Type", "application/json")
+                .setBody("""{"error":"revision_conflict"}"""),
+        )
+        val request = BootstrapResolutionRequest(
+            requestId = "bootstrap-request-1",
+            deviceId = "device-1",
+            expectedRevision = 12,
+            strategy = BootstrapStrategy.KeepRemote,
+            commands = emptyList(),
+            taskOperations = emptyList(),
+            durationOperations = emptyList(),
+        )
+
+        val error = capture<BootstrapConflictException> {
+            api.resolveBootstrap("access-token", request)
+        }
+
+        assertEquals(BootstrapConflictKind.Revision, error.kind)
+        assertEquals(409, error.statusCode)
+        assertEquals("revision_conflict", error.message)
     }
 
     @Test
@@ -258,6 +339,20 @@ class PomodoroughApiTest {
         .setResponseCode(200)
         .setHeader("Content-Type", "application/json")
         .setBody(body)
+
+    private fun canonicalResponse(revision: Long) = """{
+        "acknowledgements":[],
+        "revision":$revision,
+        "canonicalTimer":null,
+        "history":[],
+        "durationAcknowledgements":[],
+        "durationsMs":{"focus":1500000,"short_break":300000,"long_break":900000},
+        "taskAcknowledgements":[],
+        "tasks":[],
+        "serverTime":"2026-01-01T00:00:00Z",
+        "serverHlcWallMs":1767225600000,
+        "serverHlcCounter":0
+    }"""
 
     private suspend inline fun <reified T : Throwable> capture(crossinline block: suspend () -> Unit): T {
         return try {

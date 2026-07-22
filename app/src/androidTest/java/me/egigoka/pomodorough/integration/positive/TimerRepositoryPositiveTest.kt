@@ -502,4 +502,264 @@ class TimerRepositoryPositiveTest {
         assertTrue(database.timerDao().pendingTaskOperations().isEmpty())
         assertEquals(repositoryJson.encodeToString(listOf(task)), database.timerDao().localState()?.tasksJson)
     }
+
+    @Test
+    fun taskDeleteSyncSendsAcknowledgesAndAcceptsRemoteDeletion() = runBlocking {
+        val profile = testUser()
+        val task = requireNotNull(TaskReducer.taskFromTitle("Delete Android task"))
+        val operation = TaskOperation(
+            id = "task-operation-delete",
+            taskId = task.id,
+            type = TaskOperationType.Delete,
+            title = null,
+            occurredAt = "2026-01-01T00:00:00Z",
+            hlcWallMs = 1_767_225_600_001,
+            hlcCounter = 0,
+        )
+        database.timerDao().insertState(
+            testState(user = profile).copy(
+                tasksJson = repositoryJson.encodeToString(listOf(task)),
+                knownTasksJson = repositoryJson.encodeToString(listOf(task)),
+            ),
+        )
+        database.timerDao().insertTaskOperation(PendingTaskOperationEntity.from(operation))
+        val service = TestRepositoryService(profile).apply {
+            syncResponse = SyncResponse(
+                acknowledgements = emptyList(),
+                revision = 1,
+                canonicalTimer = null,
+                history = emptyList(),
+                durationAcknowledgements = emptyList(),
+                durationsMs = DurationsMs(),
+                taskAcknowledgements = listOf(TaskAcknowledgement(operation.id, "applied", "")),
+                tasks = emptyList(),
+                serverTime = "2026-01-01T00:00:00Z",
+                serverHlcWallMs = 1_767_225_600_100,
+                serverHlcCounter = 0,
+            )
+        }
+        val repository = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+
+        repository.initialize()
+        awaitState { service.syncCalls == 1 && repository.state.value.pendingCount == 0 }
+
+        assertEquals(listOf(operation), service.syncRequests.single().taskOperations)
+        assertTrue(database.timerDao().pendingTaskOperations().isEmpty())
+        assertTrue(repository.state.value.tasks.isEmpty())
+        assertEquals("[]", database.timerDao().localState()?.tasksJson)
+    }
+
+    @Test
+    fun remoteBootstrapDeletesCanonicalTaskWithoutLocalOperation() = runBlocking {
+        val profile = testUser()
+        val task = requireNotNull(TaskReducer.taskFromTitle("Remote deletion"))
+        database.timerDao().insertState(
+            testState(user = profile).copy(
+                tasksJson = repositoryJson.encodeToString(listOf(task)),
+                knownTasksJson = repositoryJson.encodeToString(listOf(task)),
+            ),
+        )
+        val service = TestRepositoryService(profile).apply {
+            bootstrapResponse = syncResponse.copy(revision = 1, tasks = emptyList())
+        }
+        val repository = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+            online = false,
+        )
+
+        repository.initialize()
+
+        assertTrue(repository.state.value.tasks.isEmpty())
+        assertTrue(database.timerDao().pendingTaskOperations().isEmpty())
+        assertEquals("[]", database.timerDao().localState()?.tasksJson)
+        assertEquals(0, service.resolveCalls)
+    }
+
+    @Test
+    fun taskOperationQueueSyncsInProtocolSizedBatches() = runBlocking {
+        val profile = testUser()
+        val operations = (1..257).map { index ->
+            val task = requireNotNull(TaskReducer.taskFromTitle("Batched task $index"))
+            TaskOperation(
+                id = "task-operation-batch-$index",
+                taskId = task.id,
+                type = TaskOperationType.Upsert,
+                title = task.title,
+                occurredAt = "2026-01-01T00:00:00Z",
+                hlcWallMs = 1_767_225_600_000 + index,
+                hlcCounter = 0,
+            )
+        }
+        database.timerDao().insertState(testState(user = profile))
+        operations.forEach {
+            database.timerDao().insertTaskOperation(PendingTaskOperationEntity.from(it))
+        }
+        val canonicalTasks = linkedMapOf<String, FocusTask>()
+        var revision = 0L
+        val service = TestRepositoryService(profile).apply {
+            syncHandler = { request ->
+                request.taskOperations.forEach { operation ->
+                    val task = requireNotNull(operation.title?.let(TaskReducer::taskFromTitle))
+                    canonicalTasks[task.id] = task
+                }
+                revision += 1
+                SyncResponse(
+                    acknowledgements = emptyList(),
+                    revision = revision,
+                    canonicalTimer = null,
+                    history = emptyList(),
+                    durationAcknowledgements = emptyList(),
+                    durationsMs = DurationsMs(),
+                    taskAcknowledgements = request.taskOperations.map {
+                        TaskAcknowledgement(it.id, "applied", "")
+                    },
+                    tasks = canonicalTasks.values.toList(),
+                    serverTime = "2026-01-01T00:00:00Z",
+                    serverHlcWallMs = 1_767_225_600_000 + revision,
+                    serverHlcCounter = 0,
+                )
+            }
+        }
+        val repository = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+
+        repository.initialize()
+        awaitState { service.syncCalls == 2 && repository.state.value.pendingCount == 0 }
+
+        assertEquals(listOf(256, 1), service.syncRequests.map { it.taskOperations.size })
+        assertTrue(database.timerDao().pendingTaskOperations().isEmpty())
+        assertEquals(257, repository.state.value.tasks.size)
+    }
+
+    @Test
+    fun commandQueueSyncsInProtocolSizedBatches() = runBlocking {
+        val profile = testUser()
+        val commands = (1L..257L).map { sequence ->
+            testCommand(
+                "command-$sequence",
+                sequence,
+                timerId = "timer-$sequence",
+                type = CommandType.Cancel,
+            )
+        }
+        database.timerDao().insertState(
+            testState(user = profile, deviceSequence = commands.last().deviceSequence),
+        )
+        commands.forEach { database.timerDao().insertCommand(PendingCommandEntity.from(it)) }
+        var revision = 0L
+        val service = TestRepositoryService(profile).apply {
+            syncHandler = { request ->
+                revision += 1
+                SyncResponse(
+                    acknowledgements = request.commands.map {
+                        Acknowledgement(it.id, "applied", "")
+                    },
+                    revision = revision,
+                    canonicalTimer = null,
+                    history = emptyList(),
+                    durationAcknowledgements = emptyList(),
+                    durationsMs = DurationsMs(),
+                    taskAcknowledgements = emptyList(),
+                    tasks = emptyList(),
+                    serverTime = "2026-01-01T00:00:00Z",
+                    serverHlcWallMs = 1_767_225_600_000 + revision,
+                    serverHlcCounter = 0,
+                )
+            }
+        }
+        val repository = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+
+        repository.initialize()
+        awaitState { service.syncCalls == 2 && repository.state.value.pendingCount == 0 }
+
+        assertEquals(listOf(256, 1), service.syncRequests.map { it.commands.size })
+        assertTrue(database.timerDao().pendingCommands().isEmpty())
+        assertEquals(2L, database.timerDao().localState()?.revision)
+    }
+
+    @Test
+    fun taskOperationCreatedDuringSyncRebasesAndSurvivesOldAcknowledgement() = runBlocking {
+        val profile = testUser()
+        val task = requireNotNull(TaskReducer.taskFromTitle("Ship Android"))
+        val sent = TaskOperation(
+            id = "task-operation-sent",
+            taskId = task.id,
+            type = TaskOperationType.Upsert,
+            title = task.title,
+            occurredAt = "2026-01-01T00:00:00Z",
+            hlcWallMs = 1_767_225_600_001,
+            hlcCounter = 0,
+        )
+        database.timerDao().insertState(
+            testState(user = profile).copy(
+                knownTasksJson = repositoryJson.encodeToString(listOf(task)),
+            ),
+        )
+        database.timerDao().insertTaskOperation(PendingTaskOperationEntity.from(sent))
+        val firstSyncStarted = CompletableDeferred<Unit>()
+        val releaseFirstSync = CompletableDeferred<Unit>()
+        var calls = 0
+        val service = TestRepositoryService(profile).apply {
+            syncHandler = { request ->
+                calls += 1
+                if (calls == 1) {
+                    firstSyncStarted.complete(Unit)
+                    releaseFirstSync.await()
+                    SyncResponse(
+                        acknowledgements = emptyList(),
+                        revision = 1,
+                        canonicalTimer = null,
+                        history = emptyList(),
+                        durationAcknowledgements = emptyList(),
+                        durationsMs = DurationsMs(),
+                        taskAcknowledgements = listOf(
+                            TaskAcknowledgement(sent.id, "applied", ""),
+                        ),
+                        tasks = listOf(task),
+                        serverTime = "2026-01-01T00:00:00Z",
+                        serverHlcWallMs = 1_767_225_600_100,
+                        serverHlcCounter = 0,
+                    )
+                } else {
+                    throw ApiException(409, "stop after task rebase verification")
+                }
+            }
+        }
+        val repository = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+
+        repository.initialize()
+        firstSyncStarted.await()
+        repository.deleteTask(task.id)
+        val replacement = database.timerDao().pendingTaskOperations().last().toModel()
+        releaseFirstSync.complete(Unit)
+        awaitState { repository.state.value.conflict == "stop after task rebase verification" }
+
+        val remaining = database.timerDao().pendingTaskOperations().single().toModel()
+        assertEquals(TaskOperationType.Delete, replacement.type)
+        assertEquals(replacement.id, remaining.id)
+        assertEquals(replacement.id, service.syncRequests[1].taskOperations.single().id)
+        assertTrue(repository.state.value.tasks.isEmpty())
+    }
 }

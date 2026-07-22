@@ -64,6 +64,7 @@ class PomodoroughDatabasePositiveTest {
         PomodoroughDatabase.Migration1To2,
         PomodoroughDatabase.Migration2To3,
         PomodoroughDatabase.Migration3To4,
+        PomodoroughDatabase.Migration4To5,
     ).build()
 
     private fun command(sequence: Long) = TimerCommand(

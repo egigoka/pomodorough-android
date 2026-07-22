@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import me.egigoka.pomodorough.data.BootstrapStrategy
 import me.egigoka.pomodorough.data.TimerRepository
 import me.egigoka.pomodorough.data.TimerStatus
 
@@ -38,6 +39,10 @@ class PomodoroughViewModel(
     fun selectTask(taskId: String?) = launch { repository.selectTask(taskId) }
     fun addTask(title: String) = launch { repository.addTask(title) }
     fun deleteTask(taskId: String) = launch { repository.deleteTask(taskId) }
+    fun resolveHistory(strategy: BootstrapStrategy) = launch { repository.resolveHistory(strategy) }
+    fun recoverHistoryResolution() = launch { repository.recoverCorruptedResolution() }
+    fun confirmAccountSwitch() = launch { repository.confirmAccountSwitch() }
+    fun cancelAccountSwitch() = launch { repository.cancelAccountSwitch() }
     fun dismissConflict() = repository.dismissConflict()
     fun dismissNotice() = repository.dismissNotice()
     fun onForeground() {

@@ -47,7 +47,7 @@ class TimerRepositoryTest {
     }
 
     @Test
-    fun differentSignedInAccountClearsPreviousSnapshotAndQueue() = runBlocking {
+    fun differentSignedInAccountRequiresExplicitDestructiveConfirmation() = runBlocking {
         val oldUser = user("old-user")
         val oldTimer = timer("old-timer")
         val oldSettings = TimerSettings(
@@ -67,7 +67,16 @@ class TimerRepositoryTest {
         repository.initialize()
         await { repository.state.value.authStatus == AuthStatus.SignedIn }
 
+        assertEquals("old-user@example.com", repository.state.value.accountSwitch?.localAccount)
+        assertEquals("new-user@example.com", repository.state.value.accountSwitch?.incomingAccount)
+        assertEquals("old-user", database.timerDao().localState()?.ownerUserId)
+        assertEquals(3, repository.state.value.pendingCount)
+        assertEquals("old-timer", repository.state.value.timer?.id)
+
+        repository.confirmAccountSwitch()
+
         val stored = database.timerDao().localState()
+        assertNull(repository.state.value.accountSwitch)
         assertEquals("new-user", repository.state.value.user?.id)
         assertNull(repository.state.value.timer)
         assertTrue(repository.state.value.history.isEmpty())
@@ -244,6 +253,17 @@ class TimerRepositoryTest {
         )
 
         override suspend fun me(accessToken: String) = MeResponse(profile, "")
+
+        override suspend fun bootstrap(accessToken: String): SyncResponse = syncResponse.copy(
+            acknowledgements = emptyList(),
+            durationAcknowledgements = emptyList(),
+            taskAcknowledgements = emptyList(),
+        )
+
+        override suspend fun resolveBootstrap(
+            accessToken: String,
+            request: BootstrapResolutionRequest,
+        ): SyncResponse = syncResponse
 
         override suspend fun sync(accessToken: String, request: SyncRequest): SyncResponse {
             syncStarted.complete(Unit)

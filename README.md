@@ -91,6 +91,12 @@ reflects it. Synchronization submits immutable pending operations and the last
 known server revision. Exact acknowledgements remove submitted entries; any
 newer local work is replayed over the canonical response.
 
+After authentication, the client reads the account bootstrap before sending any
+queued operation. First-account sign-in preserves unowned local history and
+automatically keeps whichever side has history; when both sides do, the user can
+keep local, keep remote, or merge. The chosen CAS request is stored in Room so a
+network failure or process restart retries the same request ID and payload.
+
 Hybrid logical clocks preserve deterministic ordering across offline devices.
 The SSE stream only announces revisions, while the HTTP sync endpoint remains
 authoritative. Refresh calls are globally serialized because reusing a rotated
@@ -142,10 +148,11 @@ by default. Configure standard Android signing before distribution. Keep Room
 schema JSON files under `app/schemas/` with every release so migration tests can
 validate upgrade paths.
 
-## Related repositories
+## Pomodorough projects
 
-- [Server and PWA](https://github.com/egigoka/pomodorough-server)
-- [Apple platforms](https://github.com/egigoka/pomodorough-ios)
+- [Server (Web/PWA and sync)](https://github.com/egigoka/pomodorough-server)
+- [iOS](https://github.com/egigoka/pomodorough-ios)
+- [Android (this project)](https://github.com/egigoka/pomodorough-android)
 - [Linux](https://github.com/egigoka/pomodorough-linux)
 
 ## License

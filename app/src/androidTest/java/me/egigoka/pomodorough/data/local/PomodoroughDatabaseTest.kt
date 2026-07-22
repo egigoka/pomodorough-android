@@ -138,6 +138,41 @@ class PomodoroughDatabaseTest {
     }
 
     @Test
+    fun bootstrapResolutionPersistenceAndApplyAreAtomic() = runBlocking {
+        val initial = state()
+        val resolution = PendingBootstrapResolutionEntity(
+            requestId = "bootstrap-request-1",
+            deviceId = initial.deviceId,
+            expectedRevision = 7,
+            strategy = "Merge",
+            commandsJson = "[]",
+            taskOperationsJson = "[]",
+            durationOperationsJson = "[]",
+            ownerUserId = "user-1",
+            userJson = "{\"id\":\"user-1\"}",
+        )
+        dao.insertState(initial)
+        dao.insertCommand(PendingCommandEntity.from(command(1)))
+        dao.insertTaskOperation(PendingTaskOperationEntity.from(taskOperation("operation-1", 1)))
+        dao.upsertDurationOperation(
+            PendingDurationOperationEntity.from(
+                durationOperation("duration-1", TimerPhase.Focus, 1_560_000, 100),
+            ),
+        )
+        dao.upsertBootstrapResolution(resolution)
+        val resolved = initial.copy(revision = 8, historyJson = "[{\"id\":\"remote\"}]")
+
+        assertEquals(resolution, dao.pendingBootstrapResolution())
+        dao.applyBootstrapResolution(resolved)
+
+        assertEquals(resolved, dao.localState())
+        assertTrue(dao.pendingCommands().isEmpty())
+        assertTrue(dao.pendingTaskOperations().isEmpty())
+        assertTrue(dao.pendingDurationOperations().isEmpty())
+        assertNull(dao.pendingBootstrapResolution())
+    }
+
+    @Test
     fun migrationOneToTwoPreservesStateAndAddsNullableOwner() {
         context.deleteDatabase(MigrationDatabaseName)
         migrationHelper.createDatabase(MigrationDatabaseName, 1).apply {
@@ -294,6 +329,40 @@ class PomodoroughDatabaseTest {
             assertTrue(it.moveToFirst())
             assertEquals(100, it.getLong(0))
             assertEquals(4, it.getLong(1))
+        }
+        migrated.close()
+    }
+
+    @Test
+    fun migrationFourToFivePreservesStateAndAddsPendingResolution() {
+        context.deleteDatabase(MigrationDatabaseName)
+        migrationHelper.createDatabase(MigrationDatabaseName, 4).apply {
+            execSQL(
+                """INSERT INTO local_state (
+                    id, deviceId, deviceSequence, hlcWallMs, hlcCounter, revision,
+                    canonicalTimerJson, historyJson, settingsJson, userJson, ownerUserId,
+                    tasksJson, knownTasksJson, selectedTaskId
+                ) VALUES (0, 'device-1', 7, 100, 2, 4, NULL, '[]', '{}', NULL,
+                    NULL, '[]', '[]', NULL)""",
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MigrationDatabaseName,
+            5,
+            true,
+            PomodoroughDatabase.Migration4To5,
+        )
+
+        migrated.query("SELECT deviceId, revision FROM local_state").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("device-1", it.getString(0))
+            assertEquals(4L, it.getLong(1))
+        }
+        migrated.query("SELECT COUNT(*) FROM pending_bootstrap_resolution").use {
+            assertTrue(it.moveToFirst())
+            assertEquals(0, it.getInt(0))
         }
         migrated.close()
     }

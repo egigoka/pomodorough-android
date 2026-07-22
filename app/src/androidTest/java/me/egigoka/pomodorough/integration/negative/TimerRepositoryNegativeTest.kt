@@ -175,6 +175,11 @@ class TimerRepositoryNegativeTest {
                 serverHlcWallMs = 1_767_225_600_100,
                 serverHlcCounter = 0,
             )
+            bootstrapResponse = syncResponse.copy(
+                revision = 0,
+                durationAcknowledgements = emptyList(),
+                durationsMs = localDurations,
+            )
         }
         val repository = testRepository(
             context,
@@ -213,6 +218,10 @@ class TimerRepositoryNegativeTest {
                 serverTime = "2026-01-01T00:00:00Z",
                 serverHlcWallMs = 1_767_225_600_100,
                 serverHlcCounter = 0,
+            )
+            bootstrapResponse = syncResponse.copy(
+                revision = 0,
+                durationsMs = DurationsMs(),
             )
         }
         val repository = testRepository(
@@ -260,6 +269,7 @@ class TimerRepositoryNegativeTest {
                     serverHlcCounter = 0,
                 )
             }
+            bootstrapResponse = syncResponse
         }
         val repository = testRepository(
             context,
@@ -317,6 +327,11 @@ class TimerRepositoryNegativeTest {
                 serverTime = "2026-01-01T00:00:00Z",
                 serverHlcWallMs = 1_767_225_600_100,
                 serverHlcCounter = 0,
+            )
+            bootstrapResponse = syncResponse.copy(
+                revision = 0,
+                taskAcknowledgements = emptyList(),
+                tasks = emptyList(),
             )
         }
         val repository = testRepository(
@@ -386,6 +401,26 @@ class TimerRepositoryNegativeTest {
     }
 
     @Test
+    fun invalidProfileIsRejectedBeforeBootstrapOrOwnerMutation() = runBlocking {
+        val owner = testUser("owner-user")
+        val command = testCommand("owner-command", sequence = 1)
+        database.timerDao().insertState(testState(user = owner, deviceSequence = 1))
+        database.timerDao().insertCommand(PendingCommandEntity.from(command))
+        val service = TestRepositoryService(owner.copy(email = "invalid-email"))
+        val auth = TestAuthSession(tokensAvailable = true)
+        val repository = testRepository(context, database.timerDao(), service, auth)
+
+        repository.initialize()
+
+        assertEquals(AuthStatus.SignedOut, repository.state.value.authStatus)
+        assertTrue(!auth.tokensAvailable)
+        assertEquals(0, service.bootstrapCalls)
+        assertNull(repository.state.value.accountSwitch)
+        assertEquals(owner.id, database.timerDao().localState()?.ownerUserId)
+        assertEquals(listOf(command.id), database.timerDao().pendingCommands().map { it.id })
+    }
+
+    @Test
     fun failedLogoutPreservesAccountDataAndReportsNotice() = runBlocking {
         val profile = testUser()
         val timer = testTimer()
@@ -394,14 +429,21 @@ class TimerRepositoryNegativeTest {
         val auth = TestAuthSession(tokensAvailable = true).apply {
             logoutFailure = IOException("logout unavailable")
         }
+        val service = TestRepositoryService(profile).apply {
+            bootstrapResponse = syncResponse.copy(
+                canonicalTimer = timer,
+                history = listOf(testHistory("history-1")),
+            )
+        }
         val repository = testRepository(
             context,
             database.timerDao(),
-            TestRepositoryService(profile),
+            service,
             auth,
             online = false,
         )
         repository.initialize()
+        val beforeLogout = database.timerDao().localState()
 
         repository.logout()
 
@@ -410,7 +452,7 @@ class TimerRepositoryNegativeTest {
         assertEquals(profile, repository.state.value.user)
         assertEquals(timer, repository.state.value.timer)
         assertEquals("logout unavailable", repository.state.value.notice)
-        assertEquals(persisted, database.timerDao().localState())
+        assertEquals(beforeLogout, database.timerDao().localState())
     }
 
     @Test

@@ -25,6 +25,20 @@ data class LocalStateEntity(
     val selectedTaskId: String? = null,
 )
 
+@Entity(tableName = "pending_bootstrap_resolution")
+data class PendingBootstrapResolutionEntity(
+    @PrimaryKey val id: Int = 0,
+    val requestId: String,
+    val deviceId: String,
+    val expectedRevision: Long,
+    val strategy: String,
+    val commandsJson: String,
+    val taskOperationsJson: String,
+    val durationOperationsJson: String,
+    val ownerUserId: String,
+    val userJson: String,
+)
+
 @Entity(tableName = "pending_commands")
 data class PendingCommandEntity(
     @PrimaryKey val id: String,

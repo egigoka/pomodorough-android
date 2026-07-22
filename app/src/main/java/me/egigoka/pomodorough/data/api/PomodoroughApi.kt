@@ -7,6 +7,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import me.egigoka.pomodorough.data.ApiError
+import me.egigoka.pomodorough.data.BootstrapResolutionRequest
 import me.egigoka.pomodorough.data.MeResponse
 import me.egigoka.pomodorough.data.NativeChallenge
 import me.egigoka.pomodorough.data.NativeExchangeRequest
@@ -25,16 +26,28 @@ import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
 
-class ApiException(
+open class ApiException(
     val statusCode: Int,
     message: String,
 ) : IOException(message)
+
+enum class BootstrapConflictKind { Revision, RequestId, Unknown }
+
+class BootstrapConflictException(
+    val kind: BootstrapConflictKind,
+    message: String,
+) : ApiException(409, message)
 
 interface PomodoroughService {
     suspend fun createChallenge(): NativeChallenge
     suspend fun exchange(request: NativeExchangeRequest): TokenPair
     suspend fun refresh(refreshToken: String): TokenPair
     suspend fun me(accessToken: String): MeResponse
+    suspend fun bootstrap(accessToken: String): SyncResponse
+    suspend fun resolveBootstrap(
+        accessToken: String,
+        request: BootstrapResolutionRequest,
+    ): SyncResponse
     suspend fun sync(accessToken: String, request: SyncRequest): SyncResponse
     suspend fun logout(accessToken: String)
     fun revisionStream(accessToken: String, listener: EventSourceListener): EventSource
@@ -58,6 +71,13 @@ class PomodoroughApi(
         post("auth/refresh", json.encodeToString(RefreshRequest(refreshToken)), null)
 
     override suspend fun me(accessToken: String): MeResponse = get("me", accessToken)
+
+    override suspend fun bootstrap(accessToken: String): SyncResponse = get("bootstrap", accessToken)
+
+    override suspend fun resolveBootstrap(
+        accessToken: String,
+        request: BootstrapResolutionRequest,
+    ): SyncResponse = post("bootstrap/resolve", json.encodeToString(request), accessToken)
 
     override suspend fun sync(accessToken: String, request: SyncRequest): SyncResponse =
         post("sync", json.encodeToString(request), accessToken)
@@ -116,6 +136,15 @@ class PomodoroughApi(
         if (response.isSuccessful) return response
         val body = response.body?.string().orEmpty()
         val error = runCatching { json.decodeFromString<ApiError>(body).error }.getOrNull()
+        if (response.code == 409 && response.request.url.encodedPath.endsWith("/bootstrap/resolve")) {
+            val normalized = error.orEmpty().lowercase().replace('-', '_').replace(' ', '_')
+            val kind = when {
+                "revision" in normalized -> BootstrapConflictKind.Revision
+                "request" in normalized && "id" in normalized -> BootstrapConflictKind.RequestId
+                else -> BootstrapConflictKind.Unknown
+            }
+            throw BootstrapConflictException(kind, error ?: "Bootstrap resolution conflict")
+        }
         throw ApiException(response.code, error ?: "Request failed (${response.code})")
     }
 

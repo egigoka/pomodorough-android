@@ -1,6 +1,7 @@
 package me.egigoka.pomodorough.unit
 
 import me.egigoka.pomodorough.data.MeResponse
+import me.egigoka.pomodorough.data.BootstrapResolutionRequest
 import me.egigoka.pomodorough.data.NativeChallenge
 import me.egigoka.pomodorough.data.NativeExchangeRequest
 import me.egigoka.pomodorough.data.SyncRequest
@@ -48,6 +49,11 @@ internal class TestAuthService : PomodoroughService {
     override suspend fun createChallenge(): NativeChallenge = error("Unused")
     override suspend fun exchange(request: NativeExchangeRequest): TokenPair = error("Unused")
     override suspend fun me(accessToken: String): MeResponse = error("Unused")
+    override suspend fun bootstrap(accessToken: String): SyncResponse = error("Unused")
+    override suspend fun resolveBootstrap(
+        accessToken: String,
+        request: BootstrapResolutionRequest,
+    ): SyncResponse = error("Unused")
     override suspend fun sync(accessToken: String, request: SyncRequest): SyncResponse = error("Unused")
     override fun revisionStream(accessToken: String, listener: EventSourceListener): EventSource =
         error("Unused")

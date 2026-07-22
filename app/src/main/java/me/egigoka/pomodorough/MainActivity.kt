@@ -55,6 +55,10 @@ class MainActivity : ComponentActivity() {
                     onSelectTask = viewModel::selectTask,
                     onAddTask = viewModel::addTask,
                     onDeleteTask = viewModel::deleteTask,
+                    onResolveHistory = viewModel::resolveHistory,
+                    onRecoverHistoryResolution = viewModel::recoverHistoryResolution,
+                    onConfirmAccountSwitch = viewModel::confirmAccountSwitch,
+                    onCancelAccountSwitch = viewModel::cancelAccountSwitch,
                     onDismissConflict = viewModel::dismissConflict,
                     onDismissNotice = viewModel::dismissNotice,
                 )

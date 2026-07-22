@@ -217,6 +217,49 @@ data class SyncRequest(
 )
 
 @Serializable
+enum class BootstrapStrategy {
+    @SerialName("keep_remote")
+    KeepRemote,
+
+    @SerialName("replace_remote")
+    ReplaceRemote,
+
+    @SerialName("merge")
+    Merge,
+}
+
+enum class ResolutionRecovery { KeepRemote, Repreview }
+
+@Serializable
+data class BootstrapResolutionRequest(
+    val requestId: String,
+    val deviceId: String,
+    val expectedRevision: Long,
+    val strategy: BootstrapStrategy,
+    val commands: List<TimerCommand>,
+    val taskOperations: List<TaskOperation>,
+    val durationOperations: List<DurationOperation>,
+)
+
+data class HistoryResolutionState(
+    val localHistoryCount: Int,
+    val remoteHistoryCount: Int,
+    val pendingStrategy: BootstrapStrategy? = null,
+    val requestId: String? = null,
+    val submitting: Boolean = false,
+    val corrupted: Boolean = false,
+    val recovery: ResolutionRecovery? = null,
+    val error: String? = null,
+)
+
+data class AccountSwitchState(
+    val localAccount: String,
+    val incomingAccount: String,
+    val submitting: Boolean = false,
+    val error: String? = null,
+)
+
+@Serializable
 data class SyncResponse(
     val acknowledgements: List<Acknowledgement>,
     val revision: Long,
