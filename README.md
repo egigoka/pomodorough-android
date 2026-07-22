@@ -1,49 +1,63 @@
-# Pomodorough Android
+# Pomodorough for Android
 
-Native Android client for [Pomodorough](https://pomodorough.egigoka.me), a
-Pomodoro timer that keeps one account clock synchronized across devices.
+<p align="center">
+  Native Jetpack Compose client for the local-first Pomodorough timer.
+</p>
 
-- Web app: <https://pomodorough.egigoka.me>
-- API base: <https://pomodorough.egigoka.me/api/v1>
-- OpenAPI: <https://pomodorough.egigoka.me/openapi.yaml>
+<p align="center">
+  <a href="https://pomodorough.egigoka.me">Web app</a> |
+  <a href="https://github.com/egigoka/pomodorough-server">Server</a> |
+  <a href="https://pomodorough.egigoka.me/openapi.yaml">API specification</a>
+</p>
 
-## Features
+Pomodorough for Android keeps focus timers, breaks, tasks, duration preferences,
+and history available without an account or network connection. Optional Google
+sign-in adds encrypted, local-first synchronization with the rest of the
+Pomodorough client family.
 
+## Highlights
+
+- Native Material 3 interface built with Jetpack Compose
 - Focus, short-break, and long-break timers with optional automatic breaks
-- Offline-first actions backed by a durable Room command queue
-- Account synchronization with optimistic local replay and canonical server state
+- Durable Room queues for timer commands, tasks, and duration changes
+- Per-focus task assignment with deterministic identities and daily totals
+- Optimistic local replay over canonical server state
 - Google sign-in through Android Credential Manager
 - Keystore-encrypted access and rotating refresh tokens
-- Timer completion alarms and notifications
-- Native Jetpack Compose interface based on Pomodorough's transit control board
+- OkHttp Server-Sent Event stream for low-latency revision updates
+- AlarmManager completion alarms and native notifications
+- Room schema export and tested migrations
+- Offline-first operation without an account
 
 ## Requirements
 
-- Android Studio or JDK 17
-- Android SDK Platform 34
+- Android Studio with JDK 17 or newer
+- Android SDK Platform 35
 - Android SDK Build Tools 35.0.0
-- Android 8.0 (API 26) or newer for installation
+- Android 8.0 (API 26) or newer on the target device
 
-## Build
+The application compiles against API 35 and currently targets API 34.
 
-Production API and OAuth values are configured by default. Build and verify with:
+## Getting started
+
+Build a debug APK:
 
 ```sh
 ./gradlew :app:assembleDebug
-./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleRelease
 ```
 
-With an emulator or device connected, run Room migration, persistence, and
-repository race tests with:
+Install it on a connected emulator or device:
 
 ```sh
-./gradlew :app:connectedDebugAndroidTest
+./gradlew :app:installDebug
 ```
 
-Generated APKs are written below `app/build/outputs/apk/`. Release APKs are
-unsigned; configure normal Android signing before distribution.
+Generated APKs are written below `app/build/outputs/apk/`.
 
-Override either endpoint or Google server client ID with Gradle properties:
+## Configuration
+
+Production values are configured by default. Override them with Gradle
+properties when targeting another deployment:
 
 ```sh
 ./gradlew :app:assembleDebug \
@@ -51,53 +65,90 @@ Override either endpoint or Google server client ID with Gradle properties:
   -PPOMODOROUGH_GOOGLE_SERVER_CLIENT_ID=example.apps.googleusercontent.com
 ```
 
-## Google Sign-In
+| Property | Purpose |
+| --- | --- |
+| `POMODOROUGH_API_BASE_URL` | Base URL for authenticated API requests and the revision stream |
+| `POMODOROUGH_GOOGLE_SERVER_CLIENT_ID` | OAuth audience requested through Credential Manager |
+
+The API base URL should include the `/api/v1` path and omit a trailing slash.
+
+## Architecture
+
+| Package | Responsibility |
+| --- | --- |
+| `ui/` | Compose screens, theme, lifecycle collection, and view-model orchestration |
+| `data/local/` | Room entities, migrations, canonical snapshots, settings, and pending queues |
+| `data/api/` | JSON API and OkHttp revision stream |
+| `data/auth/` | Nonce-bound Google exchange, serialized refresh, and encrypted token storage |
+| `domain/TimerReducer.kt` | Deterministic timer command replay |
+| `domain/TaskReducer.kt` | Deterministic task projection and identity normalization |
+| `data/TimerRepository.kt` | Durable actions, sync serialization, retries, reconciliation, and alarms |
+
+## Synchronization model
+
+Every timer, task, or duration operation is committed to Room before the UI
+reflects it. Synchronization submits immutable pending operations and the last
+known server revision. Exact acknowledgements remove submitted entries; any
+newer local work is replayed over the canonical response.
+
+Hybrid logical clocks preserve deterministic ordering across offline devices.
+The SSE stream only announces revisions, while the HTTP sync endpoint remains
+authoritative. Refresh calls are globally serialized because reusing a rotated
+refresh token invalidates its session family.
+
+## Google sign-in
 
 Credential Manager requests an ID token for
-`POMODOROUGH_GOOGLE_SERVER_CLIENT_ID`. Google Cloud must also have an Android
-OAuth client configured for package `me.egigoka.pomodorough` and each signing
-certificate SHA-1 used by distributed builds. Run `./gradlew signingReport` to
-inspect local signing fingerprints.
+`POMODOROUGH_GOOGLE_SERVER_CLIENT_ID`. Google Cloud must also contain an Android
+OAuth client for package `me.egigoka.pomodorough` and each signing certificate
+used by distributed builds.
 
-The API deployment must include every possible token `aud` and `azp` value in
-`GOOGLE_NATIVE_CLIENT_IDS`. For the production defaults this includes the web
-client ID:
+Inspect local signing fingerprints with:
+
+```sh
+./gradlew signingReport
+```
+
+The server's `GOOGLE_NATIVE_CLIENT_IDS` must accept every possible token `aud`
+and `azp` value. The production web client ID is:
 
 ```text
 614768274539-5jrk37jie6415babe51ae4qiupif0m7v.apps.googleusercontent.com
 ```
 
-It must also include any Android OAuth client ID Google emits as `azp`.
+## Testing
 
-## Architecture
+Run JVM tests, lint, and both build variants:
 
-- `ui/` contains Compose screens, theme, and lifecycle-aware view model.
-- `data/local/` stores canonical snapshots, settings, and immutable pending
-  commands in Room.
-- `data/api/` implements the JSON API and SSE revision stream with OkHttp.
-- `data/auth/` performs nonce-bound Google exchange and serializes refresh-token
-  rotation. Token pairs are encrypted with Android Keystore and replaced as one
-  durable value.
-- `domain/TimerReducer.kt` replays pending commands over the latest canonical
-  timer to keep offline interaction deterministic.
-- `data/TimerRepository.kt` coordinates durable actions, network recovery,
-  serialized sync, retries, SSE hints, and timer alarms.
+```sh
+./gradlew \
+  :app:testDebugUnitTest \
+  :app:lintDebug \
+  :app:assembleDebug \
+  :app:assembleRelease
+```
 
-Local timer actions are persisted before appearing in UI. Sync acknowledgements
-remove commands regardless of outcome, then remaining commands replay over the
-server snapshot. Refresh calls are globally serialized because reusing a rotated
-refresh token revokes its complete session family.
+Run Room migration, persistence, Compose, and repository integration tests on
+an emulator or connected device:
+
+```sh
+./gradlew :app:connectedDebugAndroidTest
+```
+
+## Release builds
+
+Release builds enable code shrinking and resource optimization but are unsigned
+by default. Configure standard Android signing before distribution. Keep Room
+schema JSON files under `app/schemas/` with every release so migration tests can
+validate upgrade paths.
+
+## Related repositories
+
+- [Server and PWA](https://github.com/egigoka/pomodorough-server)
+- [Apple platforms](https://github.com/egigoka/pomodorough-ios)
+- [Linux](https://github.com/egigoka/pomodorough-linux)
 
 ## License
 
-Pomodorough Android is free software: you can redistribute it and/or modify it
-under the terms of the GNU General Public License as published by the Free
-Software Foundation, either version 3 of the License, or (at your option) any
-later version.
-
-Pomodorough Android is distributed in the hope that it will be useful, but
-WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for details.
-
-Complete corresponding source for every distributed release, including build
-files, must remain available under these terms.
+Pomodorough for Android is licensed under the GNU General Public License v3.0
+or later. See [LICENSE](LICENSE).

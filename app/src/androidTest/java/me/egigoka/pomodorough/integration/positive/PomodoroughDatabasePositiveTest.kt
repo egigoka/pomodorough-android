@@ -60,7 +60,11 @@ class PomodoroughDatabasePositiveTest {
         context,
         PomodoroughDatabase::class.java,
         DatabaseName,
-    ).addMigrations(PomodoroughDatabase.Migration1To2).build()
+    ).addMigrations(
+        PomodoroughDatabase.Migration1To2,
+        PomodoroughDatabase.Migration2To3,
+        PomodoroughDatabase.Migration3To4,
+    ).build()
 
     private fun command(sequence: Long) = TimerCommand(
         id = "command-$sequence",

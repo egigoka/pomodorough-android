@@ -52,6 +52,9 @@ class MainActivity : ComponentActivity() {
                     onSelectPhase = viewModel::selectPhase,
                     onChangeDuration = viewModel::changeDuration,
                     onSetAutoStart = viewModel::setAutoStart,
+                    onSelectTask = viewModel::selectTask,
+                    onAddTask = viewModel::addTask,
+                    onDeleteTask = viewModel::deleteTask,
                     onDismissConflict = viewModel::dismissConflict,
                     onDismissNotice = viewModel::dismissNotice,
                 )

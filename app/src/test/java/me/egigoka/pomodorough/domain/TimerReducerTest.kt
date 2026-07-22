@@ -43,7 +43,7 @@ class TimerReducerTest {
 
     @Test
     fun finishCreatesQueuedCompletion() {
-        val running = timer(status = TimerStatus.Running)
+        val running = timer(status = TimerStatus.Running, taskId = "task-1")
         val finish = command(
             sequence = 1,
             type = CommandType.Finish,
@@ -58,6 +58,7 @@ class TimerReducerTest {
         assertEquals(1, projection.history.size)
         assertEquals("timer-1:command-1", projection.history.single().id)
         assertTrue(projection.history.single().pending)
+        assertEquals("task-1", projection.history.single().taskId)
     }
 
     @Test
@@ -203,6 +204,7 @@ class TimerReducerTest {
         durationMs: Long = 1_500_000,
         elapsedMs: Long = 0,
         anchorAt: String = "2026-01-01T00:00:00Z",
+        taskId: String? = null,
     ) = CanonicalTimer(
         id = "timer-1",
         phase = TimerPhase.Focus,
@@ -210,6 +212,7 @@ class TimerReducerTest {
         plannedDurationMs = durationMs,
         elapsedAtAnchorMs = elapsedMs,
         anchorAt = anchorAt,
+        taskId = taskId,
     )
 
     private fun command(

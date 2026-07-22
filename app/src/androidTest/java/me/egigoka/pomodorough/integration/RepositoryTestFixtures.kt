@@ -8,6 +8,8 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import me.egigoka.pomodorough.data.CanonicalTimer
 import me.egigoka.pomodorough.data.CommandType
+import me.egigoka.pomodorough.data.DurationOperation
+import me.egigoka.pomodorough.data.DurationsMs
 import me.egigoka.pomodorough.data.HistoryItem
 import me.egigoka.pomodorough.data.MeResponse
 import me.egigoka.pomodorough.data.NativeChallenge
@@ -59,7 +61,9 @@ internal class TestRepositoryService(
 ) : PomodoroughService {
     var syncCalls = 0
     val syncRequests = mutableListOf<SyncRequest>()
+    var meFailure: Throwable? = null
     var syncFailure: Throwable? = null
+    var syncHandler: (suspend (SyncRequest) -> SyncResponse)? = null
     var syncResponse = SyncResponse(
         acknowledgements = emptyList(),
         revision = 0,
@@ -67,15 +71,23 @@ internal class TestRepositoryService(
         history = emptyList(),
         serverTime = "2026-01-01T00:00:00Z",
         serverHlcWallMs = 1_767_225_600_000,
+        serverHlcCounter = 0,
+        durationAcknowledgements = emptyList(),
+        durationsMs = DurationsMs(),
+        taskAcknowledgements = emptyList(),
+        tasks = emptyList(),
     )
 
-    override suspend fun me(accessToken: String) = MeResponse(profile, "csrf-token")
+    override suspend fun me(accessToken: String): MeResponse {
+        meFailure?.let { throw it }
+        return MeResponse(profile, "csrf-token")
+    }
 
     override suspend fun sync(accessToken: String, request: SyncRequest): SyncResponse {
         syncCalls += 1
         syncRequests += request
         syncFailure?.let { throw it }
-        return syncResponse
+        return syncHandler?.invoke(request) ?: syncResponse
     }
 
     override suspend fun createChallenge(): NativeChallenge = error("Unused")
@@ -169,6 +181,21 @@ internal fun testCommand(
     hlcWallMs = 1_767_225_600_000 + sequence,
     hlcCounter = 0,
     observedElapsedMs = 0,
+)
+
+internal fun testDurationOperation(
+    id: String,
+    phase: String,
+    durationMs: Long,
+    wallMs: Long = 1_767_225_600_000,
+    counter: Long = 0,
+) = DurationOperation(
+    id = id,
+    phase = phase,
+    durationMs = durationMs,
+    occurredAt = "2026-01-01T00:00:00Z",
+    hlcWallMs = wallMs,
+    hlcCounter = counter,
 )
 
 internal suspend fun awaitState(condition: () -> Boolean) {

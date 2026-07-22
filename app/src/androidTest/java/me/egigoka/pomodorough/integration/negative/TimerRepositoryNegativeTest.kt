@@ -5,21 +5,34 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import java.io.IOException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import me.egigoka.pomodorough.data.Acknowledgement
 import me.egigoka.pomodorough.data.AuthStatus
+import me.egigoka.pomodorough.data.DurationAcknowledgement
+import me.egigoka.pomodorough.data.DurationsMs
+import me.egigoka.pomodorough.data.FocusTask
+import me.egigoka.pomodorough.data.SyncResponse
 import me.egigoka.pomodorough.data.SyncStatus
+import me.egigoka.pomodorough.data.TaskAcknowledgement
+import me.egigoka.pomodorough.data.TaskOperation
+import me.egigoka.pomodorough.data.TaskOperationType
 import me.egigoka.pomodorough.data.TimerPhase
 import me.egigoka.pomodorough.data.TimerSettings
 import me.egigoka.pomodorough.data.api.ApiException
 import me.egigoka.pomodorough.data.auth.AuthenticationRequired
 import me.egigoka.pomodorough.data.local.LocalStateEntity
 import me.egigoka.pomodorough.data.local.PendingCommandEntity
+import me.egigoka.pomodorough.data.local.PendingDurationOperationEntity
+import me.egigoka.pomodorough.data.local.PendingTaskOperationEntity
 import me.egigoka.pomodorough.data.local.PomodoroughDatabase
 import me.egigoka.pomodorough.integration.TestAuthSession
 import me.egigoka.pomodorough.integration.TestRepositoryService
 import me.egigoka.pomodorough.integration.awaitState
 import me.egigoka.pomodorough.integration.repositoryJson
 import me.egigoka.pomodorough.integration.testCommand
+import me.egigoka.pomodorough.integration.testDurationOperation
 import me.egigoka.pomodorough.integration.testHistory
 import me.egigoka.pomodorough.integration.testRepository
 import me.egigoka.pomodorough.integration.testState
@@ -133,6 +146,243 @@ class TimerRepositoryNegativeTest {
         assertEquals(1, repository.state.value.pendingCount)
         assertEquals(listOf(command.id), database.timerDao().pendingCommands().map { it.id })
         assertEquals(1, service.syncCalls)
+    }
+
+    @Test
+    fun incompleteDurationAcknowledgementSetKeepsPendingOperationAndCanonicalState() = runBlocking {
+        val profile = testUser()
+        val operation = testDurationOperation(
+            id = "duration-1",
+            phase = TimerPhase.Focus,
+            durationMs = 26 * 60_000L,
+        )
+        val localDurations = DurationsMs(focus = operation.durationMs)
+        database.timerDao().insertState(
+            testState(user = profile, settings = TimerSettings().withDurations(localDurations)),
+        )
+        database.timerDao().upsertDurationOperation(PendingDurationOperationEntity.from(operation))
+        val service = TestRepositoryService(profile).apply {
+            syncResponse = SyncResponse(
+                acknowledgements = emptyList(),
+                revision = 1,
+                canonicalTimer = null,
+                history = emptyList(),
+                durationAcknowledgements = emptyList(),
+                durationsMs = DurationsMs(focus = 30 * 60_000L),
+                taskAcknowledgements = emptyList(),
+                tasks = emptyList(),
+                serverTime = "2026-01-01T00:00:00Z",
+                serverHlcWallMs = 1_767_225_600_100,
+                serverHlcCounter = 0,
+            )
+        }
+        val repository = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+
+        repository.initialize()
+        awaitState { repository.state.value.syncStatus == SyncStatus.Conflict }
+
+        assertEquals(
+            "Sync returned an invalid duration acknowledgement set",
+            repository.state.value.conflict,
+        )
+        assertEquals(1, repository.state.value.pendingCount)
+        assertEquals(operation.id, database.timerDao().pendingDurationOperations().single().id)
+        assertEquals(operation.durationMs, repository.state.value.settings.durationMsFor(TimerPhase.Focus))
+        assertEquals(0L, database.timerDao().localState()?.revision)
+    }
+
+    @Test
+    fun invalidCanonicalDurationsDoNotReplaceLocalState() = runBlocking {
+        val profile = testUser()
+        database.timerDao().insertState(testState(user = profile))
+        val service = TestRepositoryService(profile).apply {
+            syncResponse = SyncResponse(
+                acknowledgements = emptyList(),
+                revision = 1,
+                canonicalTimer = null,
+                history = emptyList(),
+                durationAcknowledgements = emptyList(),
+                durationsMs = DurationsMs(focus = 1_500_001),
+                taskAcknowledgements = emptyList(),
+                tasks = emptyList(),
+                serverTime = "2026-01-01T00:00:00Z",
+                serverHlcWallMs = 1_767_225_600_100,
+                serverHlcCounter = 0,
+            )
+        }
+        val repository = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+
+        repository.initialize()
+        awaitState { repository.state.value.syncStatus == SyncStatus.Conflict }
+
+        assertEquals("Sync returned invalid canonical durations", repository.state.value.conflict)
+        assertEquals(DurationsMs(), repository.state.value.settings.effectiveDurationsMs())
+        assertEquals(0L, database.timerDao().localState()?.revision)
+    }
+
+    @Test
+    fun foreignCommandAcknowledgementCannotDeleteInFlightNewCommand() = runBlocking {
+        val profile = testUser()
+        val sent = testCommand("command-sent", sequence = 1)
+        database.timerDao().insertState(testState(user = profile, deviceSequence = 1))
+        database.timerDao().insertCommand(PendingCommandEntity.from(sent))
+        val syncStarted = CompletableDeferred<Unit>()
+        val releaseSync = CompletableDeferred<Unit>()
+        var inFlightId: String? = null
+        val service = TestRepositoryService(profile).apply {
+            syncHandler = {
+                syncStarted.complete(Unit)
+                releaseSync.await()
+                SyncResponse(
+                    acknowledgements = listOf(
+                        Acknowledgement(sent.id, "applied", ""),
+                        Acknowledgement(requireNotNull(inFlightId), "applied", ""),
+                    ),
+                    revision = 1,
+                    canonicalTimer = null,
+                    history = emptyList(),
+                    durationAcknowledgements = emptyList(),
+                    durationsMs = DurationsMs(),
+                    taskAcknowledgements = emptyList(),
+                    tasks = emptyList(),
+                    serverTime = "2026-01-01T00:00:00Z",
+                    serverHlcWallMs = 1_767_225_600_100,
+                    serverHlcCounter = 0,
+                )
+            }
+        }
+        val repository = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+
+        repository.initialize()
+        syncStarted.await()
+        repository.toggleTimer()
+        val inFlight = database.timerDao().pendingCommands().last()
+        inFlightId = inFlight.id
+        releaseSync.complete(Unit)
+        awaitState { repository.state.value.syncStatus == SyncStatus.Conflict }
+        delay(100)
+
+        assertEquals(
+            "Sync returned an invalid command acknowledgement set",
+            repository.state.value.conflict,
+        )
+        assertEquals(listOf(sent.id, inFlight.id), database.timerDao().pendingCommands().map { it.id })
+        assertEquals(0L, database.timerDao().localState()?.revision)
+        assertEquals(1, service.syncCalls)
+    }
+
+    @Test
+    fun duplicateTaskAcknowledgementsCannotMutateQueueOrSnapshot() = runBlocking {
+        val profile = testUser()
+        val task = FocusTask("task-1", "Ship")
+        val operation = TaskOperation(
+            id = "task-operation-1",
+            taskId = task.id,
+            type = TaskOperationType.Upsert,
+            title = task.title,
+            occurredAt = "2026-01-01T00:00:00Z",
+            hlcWallMs = 1_767_225_600_001,
+            hlcCounter = 0,
+        )
+        database.timerDao().insertState(testState(user = profile))
+        database.timerDao().insertTaskOperation(PendingTaskOperationEntity.from(operation))
+        val service = TestRepositoryService(profile).apply {
+            syncResponse = SyncResponse(
+                acknowledgements = emptyList(),
+                revision = 1,
+                canonicalTimer = null,
+                history = emptyList(),
+                durationAcknowledgements = emptyList(),
+                durationsMs = DurationsMs(),
+                taskAcknowledgements = listOf(
+                    TaskAcknowledgement(operation.id, "applied", ""),
+                    TaskAcknowledgement(operation.id, "applied", ""),
+                ),
+                tasks = listOf(task),
+                serverTime = "2026-01-01T00:00:00Z",
+                serverHlcWallMs = 1_767_225_600_100,
+                serverHlcCounter = 0,
+            )
+        }
+        val repository = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+
+        repository.initialize()
+        awaitState { repository.state.value.syncStatus == SyncStatus.Conflict }
+
+        assertEquals("Sync returned an invalid task acknowledgement set", repository.state.value.conflict)
+        assertEquals(operation.id, database.timerDao().pendingTaskOperations().single().id)
+        assertEquals(0L, database.timerDao().localState()?.revision)
+    }
+
+    @Test
+    fun nonMinutePendingDurationIsTerminalWithoutNetworkMutation() = runBlocking {
+        val profile = testUser()
+        val operation = testDurationOperation(
+            id = "duration-invalid-minute",
+            phase = TimerPhase.Focus,
+            durationMs = 1_500_001,
+        )
+        database.timerDao().insertState(testState(user = profile))
+        database.timerDao().upsertDurationOperation(PendingDurationOperationEntity.from(operation))
+        val service = TestRepositoryService(profile)
+        val repository = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+
+        repository.initialize()
+        awaitState { repository.state.value.syncStatus == SyncStatus.Conflict }
+
+        assertEquals("Queued duration operation is invalid", repository.state.value.conflict)
+        assertEquals(operation.id, database.timerDao().pendingDurationOperations().single().id)
+        assertEquals(0, service.syncCalls)
+    }
+
+    @Test
+    fun cachedOwnerIsNotTrustedWhenProfileVerificationFails() = runBlocking {
+        val profile = testUser("cached-user")
+        val command = testCommand("command-1", sequence = 1)
+        database.timerDao().insertState(testState(user = profile, deviceSequence = 1))
+        database.timerDao().insertCommand(PendingCommandEntity.from(command))
+        val service = TestRepositoryService(profile).apply {
+            meFailure = IOException("profile unavailable")
+        }
+        val repository = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+
+        repository.initialize()
+
+        assertEquals(AuthStatus.SignedOut, repository.state.value.authStatus)
+        assertNull(repository.state.value.user)
+        assertEquals("profile unavailable", repository.state.value.notice)
+        assertEquals(0, service.syncCalls)
+        assertEquals(command.id, database.timerDao().pendingCommands().single().id)
     }
 
     @Test

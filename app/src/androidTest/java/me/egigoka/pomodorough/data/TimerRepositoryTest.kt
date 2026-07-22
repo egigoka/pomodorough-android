@@ -16,6 +16,8 @@ import me.egigoka.pomodorough.data.api.PomodoroughService
 import me.egigoka.pomodorough.data.auth.AuthSession
 import me.egigoka.pomodorough.data.local.LocalStateEntity
 import me.egigoka.pomodorough.data.local.PendingCommandEntity
+import me.egigoka.pomodorough.data.local.PendingDurationOperationEntity
+import me.egigoka.pomodorough.data.local.PendingTaskOperationEntity
 import me.egigoka.pomodorough.data.local.PomodoroughDatabase
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
@@ -48,9 +50,17 @@ class TimerRepositoryTest {
     fun differentSignedInAccountClearsPreviousSnapshotAndQueue() = runBlocking {
         val oldUser = user("old-user")
         val oldTimer = timer("old-timer")
-        val state = state(oldUser, oldTimer)
+        val oldSettings = TimerSettings(
+            selectedPhase = TimerPhase.LongBreak,
+            autoStartBreaks = true,
+        ).withDurations(DurationsMs(focus = 45 * 60_000L))
+        val state = state(oldUser, oldTimer).copy(settingsJson = json.encodeToString(oldSettings))
         database.timerDao().insertState(state)
         database.timerDao().insertCommand(PendingCommandEntity.from(command("old-command", "old-timer")))
+        database.timerDao().insertTaskOperation(PendingTaskOperationEntity.from(taskOperation()))
+        database.timerDao().upsertDurationOperation(
+            PendingDurationOperationEntity.from(durationOperation()),
+        )
         val service = FakeService(user("new-user"))
         val repository = repository(service)
 
@@ -66,6 +76,12 @@ class TimerRepositoryTest {
         assertNull(stored?.canonicalTimerJson)
         assertEquals("[]", stored?.historyJson)
         assertTrue(database.timerDao().pendingCommands().isEmpty())
+        assertTrue(database.timerDao().pendingTaskOperations().isEmpty())
+        assertTrue(database.timerDao().pendingDurationOperations().isEmpty())
+        assertTrue(repository.state.value.tasks.isEmpty())
+        assertEquals(DurationsMs(), repository.state.value.settings.effectiveDurationsMs())
+        assertEquals(TimerPhase.LongBreak, repository.state.value.settings.selectedPhase)
+        assertTrue(repository.state.value.settings.autoStartBreaks)
     }
 
     @Test
@@ -82,6 +98,11 @@ class TimerRepositoryTest {
                 history = listOf(history("server-history")),
                 serverTime = "2026-01-01T00:00:00Z",
                 serverHlcWallMs = 1_767_225_600_000,
+                serverHlcCounter = 0,
+                durationAcknowledgements = emptyList(),
+                durationsMs = DurationsMs(),
+                taskAcknowledgements = emptyList(),
+                tasks = emptyList(),
             )
             blockSync = true
         }
@@ -173,6 +194,25 @@ class TimerRepositoryTest {
         observedElapsedMs = 300_000,
     )
 
+    private fun taskOperation() = TaskOperation(
+        id = "task-operation-1",
+        taskId = "aaf83054-24b2-8c0e-901f-a974147bfe82",
+        type = TaskOperationType.Upsert,
+        title = "Café",
+        occurredAt = "2026-01-01T00:00:00Z",
+        hlcWallMs = 1_767_225_600_000,
+        hlcCounter = 0,
+    )
+
+    private fun durationOperation() = DurationOperation(
+        id = "duration-operation-1",
+        phase = TimerPhase.Focus,
+        durationMs = 1_800_000,
+        occurredAt = "2026-01-01T00:00:00Z",
+        hlcWallMs = 1_767_225_600_001,
+        hlcCounter = 0,
+    )
+
     private class FakeAuthSession : AuthSession {
         var logoutCalls = 0
 
@@ -196,6 +236,11 @@ class TimerRepositoryTest {
             history = emptyList(),
             serverTime = "2026-01-01T00:00:00Z",
             serverHlcWallMs = 1_767_225_600_000,
+            serverHlcCounter = 0,
+            durationAcknowledgements = emptyList(),
+            durationsMs = DurationsMs(),
+            taskAcknowledgements = emptyList(),
+            tasks = emptyList(),
         )
 
         override suspend fun me(accessToken: String) = MeResponse(profile, "")

@@ -47,6 +47,7 @@ object TimerReducer {
                 plannedDurationMs = command.plannedDurationMs,
                 elapsedAtAnchorMs = 0,
                 anchorAt = command.occurredAt,
+                taskId = command.taskId,
                 lastIntent = intent,
             )
 
@@ -82,7 +83,7 @@ object TimerReducer {
                     anchorAt = command.occurredAt,
                     lastIntent = intent,
                 )
-            }?.also {
+            }?.also { completedTimer ->
                 if (history.none { item -> item.commandId == command.id }) {
                     history.add(
                         0,
@@ -96,6 +97,7 @@ object TimerReducer {
                             completedAt = command.occurredAt,
                             endedAt = command.occurredAt,
                             pending = true,
+                            taskId = completedTimer.taskId,
                         ),
                     )
                 }

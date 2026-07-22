@@ -31,10 +31,13 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ContainedLoadingIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -77,7 +80,9 @@ import kotlinx.coroutines.delay
 import me.egigoka.pomodorough.data.AppState
 import me.egigoka.pomodorough.data.AuthStatus
 import me.egigoka.pomodorough.data.CanonicalTimer
+import me.egigoka.pomodorough.data.FocusTask
 import me.egigoka.pomodorough.data.HistoryItem
+import me.egigoka.pomodorough.data.TaskDailySummary
 import me.egigoka.pomodorough.data.SyncStatus
 import me.egigoka.pomodorough.data.TimerPhase
 import me.egigoka.pomodorough.data.TimerSettings
@@ -96,6 +101,9 @@ fun PomodoroughScreen(
     onSelectPhase: (String) -> Unit,
     onChangeDuration: (String, Int) -> Unit,
     onSetAutoStart: (Boolean) -> Unit,
+    onSelectTask: (String?) -> Unit,
+    onAddTask: (String) -> Unit,
+    onDeleteTask: (String) -> Unit,
     onDismissConflict: () -> Unit,
     onDismissNotice: () -> Unit,
 ) {
@@ -118,6 +126,9 @@ fun PomodoroughScreen(
                 onSelectPhase = onSelectPhase,
                 onChangeDuration = onChangeDuration,
                 onSetAutoStart = onSetAutoStart,
+                onSelectTask = onSelectTask,
+                onAddTask = onAddTask,
+                onDeleteTask = onDeleteTask,
                 onDismissConflict = onDismissConflict,
                 onDismissNotice = onDismissNotice,
             )
@@ -255,10 +266,14 @@ private fun TimerScreen(
     onSelectPhase: (String) -> Unit,
     onChangeDuration: (String, Int) -> Unit,
     onSetAutoStart: (Boolean) -> Unit,
+    onSelectTask: (String?) -> Unit,
+    onAddTask: (String) -> Unit,
+    onDeleteTask: (String) -> Unit,
     onDismissConflict: () -> Unit,
     onDismissNotice: () -> Unit,
 ) {
     var showLogoutDialog by remember { mutableStateOf(false) }
+    var activeScreen by remember { mutableStateOf(SignedInScreen.Timer) }
     val completedHistory = remember(state.history) {
         state.history
             .filter { it.status == TimerStatus.Completed }
@@ -280,10 +295,17 @@ private fun TimerScreen(
         item {
             AppHeader(state = state, onLogout = { showLogoutDialog = true })
         }
+        item {
+            ScreenSwitcher(
+                active = activeScreen,
+                onSelect = { activeScreen = it },
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+            )
+        }
         if (state.conflict != null) {
             item {
                 MessageCard(
-                    title = "Timer moved to another device",
+                    title = "Changes resolved on another device",
                     message = state.conflict,
                     containerColor = Tomato,
                     onDismiss = onDismissConflict,
@@ -300,7 +322,7 @@ private fun TimerScreen(
                 )
             }
         }
-        item {
+        if (activeScreen == SignedInScreen.Timer) item {
             Column(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 18.dp),
                 verticalArrangement = Arrangement.spacedBy(24.dp),
@@ -308,11 +330,21 @@ private fun TimerScreen(
                 TimerHero(
                     timer = state.timer,
                     settings = state.settings,
+                    taskTitle = state.timer?.taskId?.let { taskId ->
+                        state.knownTasks.firstOrNull { it.id == taskId }?.title
+                    },
                     ready = state.ready,
                     onToggleTimer = onToggleTimer,
                     onFinishTimer = onFinishTimer,
                     onCancelTimer = onCancelTimer,
                     onClearTimer = onClearTimer,
+                )
+                TaskSelector(
+                    tasks = state.tasks,
+                    selectedTaskId = state.selectedTaskId,
+                    timer = state.timer,
+                    selectedPhase = state.settings.selectedPhase,
+                    onSelectTask = onSelectTask,
                 )
                 PatternSection(
                     settings = state.settings,
@@ -324,7 +356,7 @@ private fun TimerScreen(
                 HistoryTitle(completedHistory.size)
             }
         }
-        if (completedHistory.isEmpty()) {
+        if (activeScreen == SignedInScreen.Timer && completedHistory.isEmpty()) {
             item {
                 Surface(
                     modifier = Modifier
@@ -341,12 +373,53 @@ private fun TimerScreen(
                     )
                 }
             }
-        } else {
+        } else if (activeScreen == SignedInScreen.Timer) {
             items(items = completedHistory, key = { it.id }) { item ->
                 HistoryRow(
                     item = item,
+                    taskTitle = item.taskId?.let { taskId ->
+                        state.knownTasks.firstOrNull { it.id == taskId }?.title
+                    },
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 5.dp),
                 )
+            }
+        }
+        if (activeScreen == SignedInScreen.Tasks) {
+            item {
+                TaskBoardHeader(
+                    summaries = state.taskSummaries,
+                    onAddTask = onAddTask,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                )
+            }
+            if (state.taskSummaries.isEmpty()) {
+                item {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        color = Lavender,
+                        shape = MaterialTheme.shapes.large,
+                    ) {
+                        Text(
+                            "Add a task to give the next focus session a destination.",
+                            modifier = Modifier.padding(22.dp),
+                            color = MutedInk,
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                    }
+                }
+            } else {
+                item {
+                    TaskColumnLabels(Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
+                }
+                items(state.taskSummaries, key = { it.task.id }) { summary ->
+                    TaskSummaryRow(
+                        summary = summary,
+                        onDelete = { onDeleteTask(summary.task.id) },
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 5.dp),
+                    )
+                }
             }
         }
         item {
@@ -436,10 +509,224 @@ private fun AppHeader(state: AppState, onLogout: () -> Unit) {
     }
 }
 
+private enum class SignedInScreen { Timer, Tasks }
+
+@Composable
+private fun ScreenSwitcher(
+    active: SignedInScreen,
+    onSelect: (SignedInScreen) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(modifier = modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        SignedInScreen.entries.forEach { screen ->
+            val selected = screen == active
+            Button(
+                onClick = { onSelect(screen) },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(50.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (selected) Violet else Lavender,
+                    contentColor = if (selected) Color.White else Ink,
+                ),
+            ) {
+                Text(screen.name.uppercase(), fontWeight = FontWeight.Black)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TaskSelector(
+    tasks: List<FocusTask>,
+    selectedTaskId: String?,
+    timer: CanonicalTimer?,
+    selectedPhase: String,
+    onSelectTask: (String?) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val active = timer?.status == TimerStatus.Running || timer?.status == TimerStatus.Paused
+    val enabled = !active && selectedPhase == TimerPhase.Focus
+    val selectedTitle = tasks.firstOrNull { it.id == selectedTaskId }?.title ?: "No task"
+
+    Surface(color = Mint, contentColor = Ink, shape = MaterialTheme.shapes.large) {
+        Column(Modifier.padding(18.dp)) {
+            SectionLabel("FOCUS TASK")
+            Spacer(Modifier.height(5.dp))
+            Text(
+                if (enabled) "Choose a task or keep this pomodoro unassigned."
+                else if (active) "Task selection is locked while timer is active."
+                else "Breaks stay unassigned.",
+                color = MutedInk,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Spacer(Modifier.height(12.dp))
+            Box(Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = { expanded = true },
+                    enabled = enabled,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp),
+                    border = BorderStroke(1.5.dp, Violet),
+                ) {
+                    Text(
+                        selectedTitle,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Start,
+                    )
+                    Text("CHANGE", style = MaterialTheme.typography.labelMedium)
+                }
+                DropdownMenu(
+                    expanded = expanded,
+                    onDismissRequest = { expanded = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("No task") },
+                        onClick = {
+                            expanded = false
+                            onSelectTask(null)
+                        },
+                    )
+                    tasks.forEach { task ->
+                        DropdownMenuItem(
+                            text = { Text(task.title, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+                            onClick = {
+                                expanded = false
+                                onSelectTask(task.id)
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TaskBoardHeader(
+    summaries: List<TaskDailySummary>,
+    onAddTask: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var draft by remember { mutableStateOf("") }
+    val totalFinished = summaries.sumOf(TaskDailySummary::finishedPomodoros)
+    val totalTime = summaries.sumOf(TaskDailySummary::timeSpentMs)
+    Column(modifier) {
+        SectionLabel("TASK BOARD")
+        Text("Focus by destination", style = MaterialTheme.typography.headlineMedium)
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "$totalFinished pomodoros · ${formatTaskDuration(totalTime)} today",
+            color = Violet,
+            style = MaterialTheme.typography.titleLarge,
+        )
+        Spacer(Modifier.height(16.dp))
+        Surface(color = Butter, contentColor = Ink, shape = MaterialTheme.shapes.large) {
+            Column(Modifier.padding(16.dp)) {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Task") },
+                    placeholder = { Text("Write release notes") },
+                    singleLine = true,
+                )
+                Spacer(Modifier.height(10.dp))
+                Button(
+                    onClick = {
+                        if (draft.isNotEmpty()) {
+                            onAddTask(draft)
+                            draft = ""
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Ink),
+                ) { Text("ADD TASK") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TaskColumnLabels(modifier: Modifier = Modifier) {
+    Row(modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
+        Text("Task", Modifier.weight(2f), style = MaterialTheme.typography.labelMedium)
+        Text(
+            "Finished pomodoros today",
+            Modifier.weight(1.2f),
+            style = MaterialTheme.typography.labelMedium,
+            textAlign = TextAlign.Center,
+        )
+        Text(
+            "Time today spent",
+            Modifier.weight(1.35f),
+            style = MaterialTheme.typography.labelMedium,
+            textAlign = TextAlign.Center,
+        )
+        Text(
+            "Action",
+            Modifier.weight(0.9f),
+            style = MaterialTheme.typography.labelMedium,
+            textAlign = TextAlign.End,
+        )
+    }
+}
+
+@Composable
+private fun TaskSummaryRow(
+    summary: TaskDailySummary,
+    onDelete: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = Ink,
+        shape = MaterialTheme.shapes.large,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                summary.task.title,
+                Modifier.weight(2f),
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.titleLarge,
+            )
+            Text(
+                summary.finishedPomodoros.toString(),
+                Modifier.weight(1.2f),
+                color = Violet,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Black,
+                textAlign = TextAlign.Center,
+            )
+            Text(
+                formatTaskDuration(summary.timeSpentMs),
+                Modifier.weight(1.35f),
+                color = Violet,
+                style = MaterialTheme.typography.labelLarge,
+                textAlign = TextAlign.Center,
+            )
+            TextButton(onClick = onDelete, modifier = Modifier.weight(0.9f)) {
+                Text("Delete", color = Danger)
+            }
+        }
+    }
+}
+
 @Composable
 private fun TimerHero(
     timer: CanonicalTimer?,
     settings: TimerSettings,
+    taskTitle: String?,
     ready: Boolean,
     onToggleTimer: () -> Unit,
     onFinishTimer: () -> Unit,
@@ -490,6 +777,22 @@ private fun TimerHero(
                 }
             }
             Spacer(Modifier.height(12.dp))
+            if (timer?.taskId != null) {
+                Surface(
+                    color = palette.onContainer.copy(alpha = 0.1f),
+                    contentColor = palette.onContainer,
+                    shape = CircleShape,
+                ) {
+                    Text(
+                        "Focus task · ${taskTitle ?: "Deleted task"}",
+                        modifier = Modifier.padding(horizontal = 13.dp, vertical = 7.dp),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+            }
             TimerOrbit(timer = timer, settings = settings, palette = palette)
             Text(
                 timerInstruction(status),
@@ -557,7 +860,7 @@ private fun TimerOrbit(timer: CanonicalTimer?, settings: TimerSettings, palette:
         }
     }
     val phase = timer?.phase ?: settings.selectedPhase
-    val duration = timer?.plannedDurationMs ?: settings.minutesFor(phase) * 60_000L
+    val duration = timer?.plannedDurationMs ?: settings.durationMsFor(phase)
     val elapsed = if (timer == null) 0 else TimerReducer.elapsedAt(timer, now)
     val remaining = (duration - elapsed).coerceAtLeast(0)
     val totalSeconds = ceil(remaining / 1000.0).toLong()
@@ -811,7 +1114,7 @@ private fun HistoryTitle(count: Int) {
 }
 
 @Composable
-private fun HistoryRow(item: HistoryItem, modifier: Modifier = Modifier) {
+private fun HistoryRow(item: HistoryItem, taskTitle: String?, modifier: Modifier = Modifier) {
     val palette = phasePalette(item.phase)
     Surface(
         modifier = modifier.fillMaxWidth(),
@@ -840,6 +1143,9 @@ private fun HistoryRow(item: HistoryItem, modifier: Modifier = Modifier) {
                     style = MaterialTheme.typography.titleLarge,
                 )
                 Text(formatHistoryDate(item), color = MutedInk, style = MaterialTheme.typography.bodyMedium)
+                if (taskTitle != null) {
+                    Text(taskTitle, color = Violet, style = MaterialTheme.typography.labelMedium)
+                }
             }
             Text(
                 "${(item.plannedDurationMs / 60_000).coerceAtLeast(1)} min",
@@ -994,6 +1300,18 @@ private fun phaseStamp(phase: String): String = when (phase) {
 private fun historyEpoch(item: HistoryItem): Long {
     val value = item.completedAt ?: item.endedAt ?: return 0
     return runCatching { Instant.parse(value).toEpochMilli() }.getOrDefault(0)
+}
+
+private fun formatTaskDuration(milliseconds: Long): String {
+    val minutes = milliseconds / 60_000
+    if (minutes == 0L) return "0 min"
+    val hours = minutes / 60
+    val remainingMinutes = minutes % 60
+    return when {
+        hours == 0L -> "$minutes min"
+        remainingMinutes == 0L -> "$hours hr"
+        else -> "$hours hr $remainingMinutes min"
+    }
 }
 
 private fun formatHistoryDate(item: HistoryItem): String {

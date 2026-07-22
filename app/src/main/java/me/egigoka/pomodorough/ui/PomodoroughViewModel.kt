@@ -35,6 +35,9 @@ class PomodoroughViewModel(
         repository.changeDuration(phase, delta)
     }
     fun setAutoStart(enabled: Boolean) = launch { repository.setAutoStart(enabled) }
+    fun selectTask(taskId: String?) = launch { repository.selectTask(taskId) }
+    fun addTask(title: String) = launch { repository.addTask(title) }
+    fun deleteTask(taskId: String) = launch { repository.deleteTask(taskId) }
     fun dismissConflict() = repository.dismissConflict()
     fun dismissNotice() = repository.dismissNotice()
     fun onForeground() {
