@@ -150,10 +150,10 @@ validate upgrade paths.
 
 ## Pomodorough projects
 
-- [Server (Web/PWA and sync)](https://github.com/egigoka/pomodorough-server)
-- [iOS](https://github.com/egigoka/pomodorough-ios)
-- [Android (this project)](https://github.com/egigoka/pomodorough-android)
-- [Linux](https://github.com/egigoka/pomodorough-linux)
+- [Server (Web/PWA and sync)](https://github.com/Pomodoro-Everywhere/pomodorough-server)
+- [Apple](https://github.com/Pomodoro-Everywhere/pomodorough-apple)
+- [Android (this project)](https://github.com/Pomodoro-Everywhere/pomodorough-android)
+- [Desktop](https://github.com/Pomodoro-Everywhere/pomodorough-desktop)
 
 ## License
 

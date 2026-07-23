@@ -309,7 +309,7 @@ class TimerRepositoryPositiveTest {
     }
 
     @Test
-    fun canonicalDurationPullKeepsLocalControlsAndActiveTimerPlan() = runBlocking {
+    fun canonicalSettingsPullKeepsDeviceLocalPhaseAndActiveTimerPlan() = runBlocking {
         val profile = testUser()
         val activeTimer = testTimer(durationMs = 25 * 60_000L)
         val serverHlcWallMs = System.currentTimeMillis() + 60_000
@@ -355,7 +355,7 @@ class TimerRepositoryPositiveTest {
 
         assertEquals(canonicalDurations, repository.state.value.settings.effectiveDurationsMs())
         assertEquals(TimerPhase.LongBreak, repository.state.value.settings.selectedPhase)
-        assertTrue(repository.state.value.settings.autoStartBreaks)
+        assertFalse(repository.state.value.settings.autoStartBreaks)
         assertEquals(25 * 60_000L, repository.state.value.timer?.plannedDurationMs)
         assertTrue(service.syncRequests.single().durationOperations.isEmpty())
         assertEquals(serverHlcWallMs, database.timerDao().localState()?.hlcWallMs)

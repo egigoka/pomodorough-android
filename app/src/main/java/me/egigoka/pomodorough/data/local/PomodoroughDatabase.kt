@@ -31,6 +31,9 @@ interface TimerDao {
     @Query("SELECT * FROM pending_duration_operations ORDER BY hlcWallMs, hlcCounter, id")
     suspend fun pendingDurationOperations(): List<PendingDurationOperationEntity>
 
+    @Query("SELECT * FROM pending_auto_start_operations ORDER BY hlcWallMs, hlcCounter, deviceId, id")
+    suspend fun pendingAutoStartOperations(): List<PendingAutoStartOperationEntity>
+
     @Query("SELECT * FROM pending_bootstrap_resolution WHERE id = 0")
     suspend fun pendingBootstrapResolution(): PendingBootstrapResolutionEntity?
 
@@ -44,6 +47,12 @@ interface TimerDao {
     suspend fun insertCommand(command: PendingCommandEntity)
 
     @Insert
+    suspend fun insertCommands(commands: List<PendingCommandEntity>)
+
+    @Update
+    suspend fun updateCommands(commands: List<PendingCommandEntity>)
+
+    @Insert
     suspend fun insertTaskOperation(operation: PendingTaskOperationEntity)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -52,11 +61,17 @@ interface TimerDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertBootstrapResolution(resolution: PendingBootstrapResolutionEntity)
 
+    @Insert
+    suspend fun insertAutoStartOperation(operation: PendingAutoStartOperationEntity)
+
     @Delete
     suspend fun deleteCommands(commands: List<PendingCommandEntity>)
 
     @Delete
     suspend fun deleteTaskOperations(operations: List<PendingTaskOperationEntity>)
+
+    @Delete
+    suspend fun deleteAutoStartOperations(operations: List<PendingAutoStartOperationEntity>)
 
     @Query("DELETE FROM pending_commands")
     suspend fun deleteAllCommands()
@@ -70,12 +85,21 @@ interface TimerDao {
     @Query("DELETE FROM pending_duration_operations")
     suspend fun deleteAllDurationOperations()
 
+    @Query("DELETE FROM pending_auto_start_operations")
+    suspend fun deleteAllAutoStartOperations()
+
     @Query("DELETE FROM pending_bootstrap_resolution")
     suspend fun deleteBootstrapResolution()
 
     @Transaction
     suspend fun persistCommand(command: PendingCommandEntity, state: LocalStateEntity) {
         insertCommand(command)
+        updateState(state)
+    }
+
+    @Transaction
+    suspend fun persistCommands(commands: List<PendingCommandEntity>, state: LocalStateEntity) {
+        insertCommands(commands)
         updateState(state)
     }
 
@@ -98,6 +122,15 @@ interface TimerDao {
     }
 
     @Transaction
+    suspend fun persistAutoStartOperation(
+        operation: PendingAutoStartOperationEntity,
+        state: LocalStateEntity,
+    ) {
+        insertAutoStartOperation(operation)
+        updateState(state)
+    }
+
+    @Transaction
     suspend fun applySync(
         acknowledged: List<PendingCommandEntity>,
         state: LocalStateEntity,
@@ -112,12 +145,20 @@ interface TimerDao {
         acknowledgedTaskOperations: List<PendingTaskOperationEntity>,
         acknowledgedDurationOperationIds: List<String>,
         state: LocalStateEntity,
+        acknowledgedAutoStartOperations: List<PendingAutoStartOperationEntity> = emptyList(),
+        releasedCommands: List<PendingCommandEntity> = emptyList(),
+        discardedCommands: List<PendingCommandEntity> = emptyList(),
     ) {
         if (acknowledgedCommands.isNotEmpty()) deleteCommands(acknowledgedCommands)
         if (acknowledgedTaskOperations.isNotEmpty()) deleteTaskOperations(acknowledgedTaskOperations)
         if (acknowledgedDurationOperationIds.isNotEmpty()) {
             deleteDurationOperationsById(acknowledgedDurationOperationIds)
         }
+        if (acknowledgedAutoStartOperations.isNotEmpty()) {
+            deleteAutoStartOperations(acknowledgedAutoStartOperations)
+        }
+        if (releasedCommands.isNotEmpty()) updateCommands(releasedCommands)
+        if (discardedCommands.isNotEmpty()) deleteCommands(discardedCommands)
         updateState(state)
     }
 
@@ -126,15 +167,22 @@ interface TimerDao {
         deleteAllCommands()
         deleteAllTaskOperations()
         deleteAllDurationOperations()
+        deleteAllAutoStartOperations()
         deleteBootstrapResolution()
         updateState(state)
     }
 
     @Transaction
-    suspend fun applyBootstrapResolution(state: LocalStateEntity) {
+    suspend fun applyBootstrapResolution(
+        state: LocalStateEntity,
+        clearAutoStartOperations: Boolean = true,
+        retainedCommands: List<PendingCommandEntity> = emptyList(),
+    ) {
         deleteAllCommands()
+        if (retainedCommands.isNotEmpty()) insertCommands(retainedCommands)
         deleteAllTaskOperations()
         deleteAllDurationOperations()
+        if (clearAutoStartOperations) deleteAllAutoStartOperations()
         deleteBootstrapResolution()
         updateState(state)
     }
@@ -147,8 +195,9 @@ interface TimerDao {
         PendingTaskOperationEntity::class,
         PendingDurationOperationEntity::class,
         PendingBootstrapResolutionEntity::class,
+        PendingAutoStartOperationEntity::class,
     ],
-    version = 5,
+    version = 7,
     exportSchema = true,
 )
 abstract class PomodoroughDatabase : RoomDatabase() {
@@ -160,7 +209,14 @@ abstract class PomodoroughDatabase : RoomDatabase() {
                 context.applicationContext,
                 PomodoroughDatabase::class.java,
                 "pomodorough.db",
-            ).addMigrations(Migration1To2, Migration2To3, Migration3To4, Migration4To5).build()
+            ).addMigrations(
+                Migration1To2,
+                Migration2To3,
+                Migration3To4,
+                Migration4To5,
+                Migration5To6,
+                Migration6To7,
+            ).build()
 
         val Migration1To2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
@@ -255,6 +311,77 @@ abstract class PomodoroughDatabase : RoomDatabase() {
                         ownerUserId TEXT NOT NULL,
                         userJson TEXT NOT NULL
                     )""".trimIndent(),
+                )
+            }
+        }
+
+        val Migration5To6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE local_state ADD COLUMN canonicalAutoStartBreaks INTEGER NOT NULL DEFAULT 0",
+                )
+                db.execSQL(
+                    "ALTER TABLE pending_bootstrap_resolution ADD COLUMN autoStartOperationsJson TEXT",
+                )
+                db.execSQL(
+                    """CREATE TABLE IF NOT EXISTS pending_auto_start_operations (
+                        id TEXT NOT NULL PRIMARY KEY,
+                        deviceId TEXT NOT NULL,
+                        enabled INTEGER NOT NULL,
+                        occurredAt TEXT NOT NULL,
+                        hlcWallMs INTEGER NOT NULL,
+                        hlcCounter INTEGER NOT NULL
+                    )""".trimIndent(),
+                )
+
+                db.query(
+                    "SELECT deviceId, settingsJson, hlcWallMs, hlcCounter FROM local_state WHERE id = 0",
+                ).use { cursor ->
+                    if (!cursor.moveToFirst()) return
+                    val settings = runCatching { JSONObject(cursor.getString(1)) }.getOrNull() ?: return
+                    if (!settings.optBoolean("autoStartBreaks", false)) return
+
+                    val now = System.currentTimeMillis()
+                    val previousWall = cursor.getLong(2)
+                    val wall = maxOf(now, previousWall, 1L)
+                    val counter = if (wall == previousWall) cursor.getLong(3) + 1 else 0
+                    db.execSQL(
+                        """INSERT INTO pending_auto_start_operations (
+                            id, deviceId, enabled, occurredAt, hlcWallMs, hlcCounter
+                        ) VALUES (?, ?, 1, ?, ?, ?)""".trimIndent(),
+                        arrayOf<Any>(
+                            UUID.randomUUID().toString(),
+                            cursor.getString(0),
+                            Instant.ofEpochMilli(now).toString(),
+                            wall,
+                            counter,
+                        ),
+                    )
+                    db.execSQL(
+                        """UPDATE local_state
+                            SET canonicalAutoStartBreaks = 1, hlcWallMs = ?, hlcCounter = ?
+                            WHERE id = 0""".trimIndent(),
+                        arrayOf<Any>(wall, counter),
+                    )
+                }
+            }
+        }
+
+        val Migration6To7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE local_state ADD COLUMN ownedTimerId TEXT")
+                db.execSQL(
+                    "ALTER TABLE pending_commands ADD COLUMN generatedByFinishCommandId TEXT",
+                )
+                // Version 6 lacks trigger-time auto-start state, so legacy commands stay independent.
+                db.execSQL(
+                    """UPDATE local_state
+                        SET ownedTimerId = (
+                            SELECT timerId FROM pending_commands
+                            WHERE type = 'start'
+                            ORDER BY deviceSequence DESC LIMIT 1
+                        )
+                        WHERE id = 0""".trimIndent(),
                 )
             }
         }

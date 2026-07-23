@@ -1,6 +1,7 @@
 package me.egigoka.pomodorough.data
 
 import kotlinx.serialization.SerialName
+import kotlinx.serialization.Required
 import kotlinx.serialization.Serializable
 
 object TimerPhase {
@@ -172,6 +173,23 @@ data class DurationAcknowledgement(
     val reason: String,
 )
 
+@Serializable
+data class AutoStartOperation(
+    val id: String,
+    val deviceId: String,
+    val enabled: Boolean,
+    val occurredAt: String,
+    val hlcWallMs: Long,
+    val hlcCounter: Long,
+)
+
+@Serializable
+data class AutoStartAcknowledgement(
+    val operationId: String,
+    val outcome: String,
+    val reason: String,
+)
+
 object TaskOperationType {
     const val Upsert = "upsert"
     const val Delete = "delete"
@@ -214,6 +232,7 @@ data class SyncRequest(
     val commands: List<TimerCommand>,
     val durationOperations: List<DurationOperation>,
     val taskOperations: List<TaskOperation> = emptyList(),
+    val autoStartOperations: List<AutoStartOperation> = emptyList(),
 )
 
 @Serializable
@@ -239,6 +258,7 @@ data class BootstrapResolutionRequest(
     val commands: List<TimerCommand>,
     val taskOperations: List<TaskOperation>,
     val durationOperations: List<DurationOperation>,
+    val autoStartOperations: List<AutoStartOperation>? = null,
 )
 
 data class HistoryResolutionState(
@@ -272,6 +292,8 @@ data class SyncResponse(
     val durationsMs: DurationsMs,
     val taskAcknowledgements: List<TaskAcknowledgement>,
     val tasks: List<FocusTask>,
+    @Required val autoStartAcknowledgements: List<AutoStartAcknowledgement> = emptyList(),
+    @Required val autoStartBreaks: Boolean = false,
 )
 
 @Serializable

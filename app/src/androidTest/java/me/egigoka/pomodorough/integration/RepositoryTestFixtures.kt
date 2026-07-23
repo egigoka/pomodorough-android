@@ -7,6 +7,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import me.egigoka.pomodorough.data.CanonicalTimer
+import me.egigoka.pomodorough.data.AutoStartOperation
 import me.egigoka.pomodorough.data.BootstrapResolutionRequest
 import me.egigoka.pomodorough.data.CommandType
 import me.egigoka.pomodorough.data.DurationOperation
@@ -71,6 +72,7 @@ internal class TestRepositoryService(
     var resolveCalls = 0
     var revisionStreamCalls = 0
     var revisionStreamCancelCalls = 0
+    var revisionListener: EventSourceListener? = null
     val syncRequests = mutableListOf<SyncRequest>()
     val resolutionRequests = mutableListOf<BootstrapResolutionRequest>()
     val callOrder = mutableListOf<String>()
@@ -139,6 +141,7 @@ internal class TestRepositoryService(
     override suspend fun logout(accessToken: String) = Unit
     override fun revisionStream(accessToken: String, listener: EventSourceListener): EventSource {
         revisionStreamCalls += 1
+        revisionListener = listener
         return object : EventSource {
             override fun request(): Request = Request.Builder()
                 .url("https://example.test/api/v1/stream")
@@ -154,7 +157,7 @@ internal class TestRepositoryService(
 internal fun testRepository(
     context: Context,
     dao: TimerDao,
-    service: TestRepositoryService = TestRepositoryService(),
+    service: PomodoroughService = TestRepositoryService(),
     auth: TestAuthSession = TestAuthSession(),
     online: Boolean = true,
 ) = TimerRepository(
@@ -180,6 +183,8 @@ internal fun testState(
     canonicalTimerJson = timer?.let(repositoryJson::encodeToString),
     historyJson = repositoryJson.encodeToString(history),
     settingsJson = repositoryJson.encodeToString(settings),
+    canonicalAutoStartBreaks = settings.autoStartBreaks,
+    ownedTimerId = timer?.id,
     userJson = user?.let(repositoryJson::encodeToString),
     ownerUserId = user?.id,
 )
@@ -246,6 +251,21 @@ internal fun testDurationOperation(
     id = id,
     phase = phase,
     durationMs = durationMs,
+    occurredAt = "2026-01-01T00:00:00Z",
+    hlcWallMs = wallMs,
+    hlcCounter = counter,
+)
+
+internal fun testAutoStartOperation(
+    id: String,
+    deviceId: String = "device-1",
+    enabled: Boolean,
+    wallMs: Long = 1_767_225_600_000,
+    counter: Long = 0,
+) = AutoStartOperation(
+    id = id,
+    deviceId = deviceId,
+    enabled = enabled,
     occurredAt = "2026-01-01T00:00:00Z",
     hlcWallMs = wallMs,
     hlcCounter = counter,

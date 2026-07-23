@@ -7,6 +7,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
+import me.egigoka.pomodorough.data.AutoStartOperation
 import me.egigoka.pomodorough.data.DurationOperation
 import me.egigoka.pomodorough.data.BootstrapResolutionRequest
 import me.egigoka.pomodorough.data.BootstrapStrategy
@@ -68,6 +69,8 @@ class PomodoroughApiTest {
             "durationsMs":{"focus":1500000,"short_break":300000,"long_break":900000},
             "taskAcknowledgements":[],
             "tasks":[],
+            "autoStartAcknowledgements":[],
+            "autoStartBreaks":false,
             "serverTime":"2026-01-01T00:00:00Z",
             "serverHlcWallMs":1767225600000,
             "serverHlcCounter":7
@@ -113,6 +116,7 @@ class PomodoroughApiTest {
             commands = emptyList(),
             taskOperations = emptyList(),
             durationOperations = emptyList(),
+            autoStartOperations = emptyList(),
         )
 
         api.resolveBootstrap("access-token", requestModel)
@@ -130,6 +134,7 @@ class PomodoroughApiTest {
                 "commands",
                 "taskOperations",
                 "durationOperations",
+                "autoStartOperations",
             ),
             body.keys,
         )
@@ -137,6 +142,7 @@ class PomodoroughApiTest {
         assertTrue(body.getValue("commands").jsonArray.isEmpty())
         assertTrue(body.getValue("taskOperations").jsonArray.isEmpty())
         assertTrue(body.getValue("durationOperations").jsonArray.isEmpty())
+        assertTrue(body.getValue("autoStartOperations").jsonArray.isEmpty())
     }
 
     @Test
@@ -177,6 +183,8 @@ class PomodoroughApiTest {
             "durationsMs":{"focus":1800000,"short_break":360000,"long_break":1200000},
             "taskAcknowledgements":[],
             "tasks":[],
+            "autoStartAcknowledgements":[],
+            "autoStartBreaks":false,
             "serverTime":"2026-01-01T00:00:00Z",
             "serverHlcWallMs":1767225600000,
             "serverHlcCounter":0
@@ -209,6 +217,56 @@ class PomodoroughApiTest {
     }
 
     @Test
+    fun autoStartSyncUsesExactWireKeysForTrueAndFalseAndDecodesAcknowledgements() = runTest {
+        server.enqueue(jsonResponse("""{
+            "acknowledgements":[],
+            "durationAcknowledgements":[],
+            "taskAcknowledgements":[],
+            "autoStartAcknowledgements":[
+                {"operationId":"00000000-0000-4000-8000-000000000001","outcome":"applied","reason":""},
+                {"operationId":"00000000-0000-4000-8000-000000000002","outcome":"applied","reason":""}
+            ],
+            "autoStartBreaks":false,
+            "revision":8,
+            "canonicalTimer":null,
+            "history":[],
+            "durationsMs":{"focus":1500000,"short_break":300000,"long_break":900000},
+            "tasks":[],
+            "serverTime":"2026-01-01T00:00:00Z",
+            "serverHlcWallMs":1767225600000,
+            "serverHlcCounter":0
+        }"""))
+        val operations = listOf(true, false).mapIndexed { index, enabled ->
+            AutoStartOperation(
+                id = "00000000-0000-4000-8000-00000000000${index + 1}",
+                deviceId = "device-1",
+                enabled = enabled,
+                occurredAt = "2026-01-01T00:00:0${index}Z",
+                hlcWallMs = 1_767_225_600_000 + index,
+                hlcCounter = 0,
+            )
+        }
+
+        val response = api.sync(
+            "access-token",
+            SyncRequest("device-1", 7, emptyList(), emptyList(), autoStartOperations = operations),
+        )
+        val encoded = Json.parseToJsonElement(server.takeRequest().body.readUtf8())
+            .jsonObject.getValue("autoStartOperations").jsonArray
+
+        assertEquals(
+            listOf("true", "false"),
+            encoded.map { it.jsonObject.getValue("enabled").jsonPrimitive.content },
+        )
+        assertEquals(
+            setOf("id", "deviceId", "enabled", "occurredAt", "hlcWallMs", "hlcCounter"),
+            encoded.first().jsonObject.keys,
+        )
+        assertEquals(operations.map { it.id }, response.autoStartAcknowledgements.map { it.operationId })
+        assertTrue(!response.autoStartBreaks)
+    }
+
+    @Test
     fun syncRejectsResponseWithoutCanonicalDurations() = runTest {
         server.enqueue(jsonResponse("""{
             "acknowledgements":[],
@@ -218,6 +276,8 @@ class PomodoroughApiTest {
             "history":[],
             "taskAcknowledgements":[],
             "tasks":[],
+            "autoStartAcknowledgements":[],
+            "autoStartBreaks":false,
             "serverTime":"2026-01-01T00:00:00Z",
             "serverHlcWallMs":1767225600000,
             "serverHlcCounter":0
@@ -238,6 +298,8 @@ class PomodoroughApiTest {
             "durationsMs":{"focus":1500000,"short_break":300000,"long_break":900000},
             "taskAcknowledgements":[],
             "tasks":[],
+            "autoStartAcknowledgements":[],
+            "autoStartBreaks":false,
             "serverTime":"2026-01-01T00:00:00Z",
             "serverHlcWallMs":1767225600000,
             "serverHlcCounter":0
@@ -258,6 +320,8 @@ class PomodoroughApiTest {
             "history":[],
             "durationsMs":{"focus":1500000,"short_break":300000,"long_break":900000},
             "tasks":[],
+            "autoStartAcknowledgements":[],
+            "autoStartBreaks":false,
             "serverTime":"2026-01-01T00:00:00Z",
             "serverHlcWallMs":1767225600000,
             "serverHlcCounter":0
@@ -278,6 +342,29 @@ class PomodoroughApiTest {
             "canonicalTimer":null,
             "history":[],
             "durationsMs":{"focus":1500000,"short_break":300000,"long_break":900000},
+            "autoStartAcknowledgements":[],
+            "autoStartBreaks":false,
+            "serverTime":"2026-01-01T00:00:00Z",
+            "serverHlcWallMs":1767225600000,
+            "serverHlcCounter":0
+        }"""))
+
+        capture<SerializationException> {
+            api.sync("access-token", SyncRequest("device-1", 7, emptyList(), emptyList()))
+        }
+    }
+
+    @Test
+    fun syncRejectsResponseWithoutRequiredAutoStartFields() = runTest {
+        server.enqueue(jsonResponse("""{
+            "acknowledgements":[],
+            "durationAcknowledgements":[],
+            "taskAcknowledgements":[],
+            "revision":8,
+            "canonicalTimer":null,
+            "history":[],
+            "durationsMs":{"focus":1500000,"short_break":300000,"long_break":900000},
+            "tasks":[],
             "serverTime":"2026-01-01T00:00:00Z",
             "serverHlcWallMs":1767225600000,
             "serverHlcCounter":0
@@ -349,6 +436,8 @@ class PomodoroughApiTest {
         "durationsMs":{"focus":1500000,"short_break":300000,"long_break":900000},
         "taskAcknowledgements":[],
         "tasks":[],
+        "autoStartAcknowledgements":[],
+        "autoStartBreaks":false,
         "serverTime":"2026-01-01T00:00:00Z",
         "serverHlcWallMs":1767225600000,
         "serverHlcCounter":0

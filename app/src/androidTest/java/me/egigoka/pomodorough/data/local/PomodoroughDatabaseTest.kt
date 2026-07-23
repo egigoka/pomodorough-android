@@ -7,6 +7,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.runBlocking
+import me.egigoka.pomodorough.data.AutoStartOperation
 import me.egigoka.pomodorough.data.CommandType
 import me.egigoka.pomodorough.data.DurationOperation
 import me.egigoka.pomodorough.data.TaskOperation
@@ -114,6 +115,19 @@ class PomodoroughDatabaseTest {
             dao.pendingDurationOperations().map(PendingDurationOperationEntity::toModel),
         )
         assertEquals(replacementState, dao.localState())
+    }
+
+    @Test
+    fun persistAutoStartOperationStoresImmutableOperationAndClockTogether() = runBlocking {
+        val initial = state()
+        val operation = autoStartOperation("00000000-0000-4000-8000-000000000001", true, 101)
+        val next = initial.copy(hlcWallMs = 101, hlcCounter = 3)
+        dao.insertState(initial)
+
+        dao.persistAutoStartOperation(PendingAutoStartOperationEntity.from(operation), next)
+
+        assertEquals(listOf(operation), dao.pendingAutoStartOperations().map { it.toModel() })
+        assertEquals(next, dao.localState())
     }
 
     @Test
@@ -367,6 +381,360 @@ class PomodoroughDatabaseTest {
         migrated.close()
     }
 
+    @Test
+    fun migrationFiveToSixMigratesEnabledPreferenceIntoCanonicalAndQueue() {
+        context.deleteDatabase(MigrationDatabaseName)
+        migrationHelper.createDatabase(MigrationDatabaseName, 5).apply {
+            execSQL(
+                """INSERT INTO local_state (
+                    id, deviceId, deviceSequence, hlcWallMs, hlcCounter, revision,
+                    canonicalTimerJson, historyJson, settingsJson, userJson, ownerUserId,
+                    tasksJson, knownTasksJson, selectedTaskId
+                ) VALUES (0, 'device-legacy', 7, 9000000000000, 4, 4, NULL, '[]',
+                    '{"autoStartBreaks":true}', NULL, 'user-1', '[]', '[]', NULL)""",
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MigrationDatabaseName,
+            6,
+            true,
+            PomodoroughDatabase.Migration5To6,
+        )
+
+        migrated.query(
+            "SELECT canonicalAutoStartBreaks, hlcWallMs, hlcCounter FROM local_state",
+        ).use {
+            assertTrue(it.moveToFirst())
+            assertEquals(1, it.getInt(0))
+            assertEquals(9_000_000_000_000, it.getLong(1))
+            assertEquals(5, it.getLong(2))
+        }
+        migrated.query(
+            """SELECT id, deviceId, enabled, hlcWallMs, hlcCounter
+                FROM pending_auto_start_operations""",
+        ).use {
+            assertTrue(it.moveToFirst())
+            assertTrue(runCatching { java.util.UUID.fromString(it.getString(0)) }.isSuccess)
+            assertEquals("device-legacy", it.getString(1))
+            assertEquals(1, it.getInt(2))
+            assertEquals(9_000_000_000_000, it.getLong(3))
+            assertEquals(5, it.getLong(4))
+            assertTrue(!it.moveToNext())
+        }
+        migrated.close()
+    }
+
+    @Test
+    fun migrationFiveToSixPromotesZeroClockIntoSyncableLocalOperation() {
+        context.deleteDatabase(MigrationDatabaseName)
+        migrationHelper.createDatabase(MigrationDatabaseName, 5).apply {
+            execSQL(
+                """INSERT INTO local_state (
+                    id, deviceId, deviceSequence, hlcWallMs, hlcCounter, revision,
+                    canonicalTimerJson, historyJson, settingsJson, userJson, ownerUserId,
+                    tasksJson, knownTasksJson, selectedTaskId
+                ) VALUES (0, 'device-zero-clock', 0, 0, 0, 0, NULL, '[]',
+                    '{"autoStartBreaks":true}', NULL, 'user-1', '[]', '[]', NULL)""",
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MigrationDatabaseName,
+            6,
+            true,
+            PomodoroughDatabase.Migration5To6,
+        )
+
+        migrated.query(
+            """SELECT id, deviceId, enabled, occurredAt, hlcWallMs, hlcCounter
+                FROM pending_auto_start_operations""",
+        ).use {
+            assertTrue(it.moveToFirst())
+            assertTrue(runCatching { java.util.UUID.fromString(it.getString(0)) }.isSuccess)
+            assertEquals("device-zero-clock", it.getString(1))
+            assertEquals(1, it.getInt(2))
+            assertTrue(runCatching { java.time.Instant.parse(it.getString(3)) }.isSuccess)
+            assertTrue(it.getLong(4) > 0)
+            assertEquals(0, it.getLong(5))
+            assertTrue(!it.moveToNext())
+        }
+        migrated.close()
+    }
+
+    @Test
+    fun migrationFiveToSixLeavesDisabledPreferenceCanonicalWithoutQueueAndPreservesOmission() {
+        context.deleteDatabase(MigrationDatabaseName)
+        migrationHelper.createDatabase(MigrationDatabaseName, 5).apply {
+            execSQL(
+                """INSERT INTO local_state (
+                    id, deviceId, deviceSequence, hlcWallMs, hlcCounter, revision,
+                    canonicalTimerJson, historyJson, settingsJson, userJson, ownerUserId,
+                    tasksJson, knownTasksJson, selectedTaskId
+                ) VALUES (0, 'device-legacy', 0, 100, 2, 0, NULL, '[]',
+                    '{"autoStartBreaks":false}', NULL, NULL, '[]', '[]', NULL)""",
+            )
+            execSQL(
+                """INSERT INTO pending_bootstrap_resolution (
+                    id, requestId, deviceId, expectedRevision, strategy, commandsJson,
+                    taskOperationsJson, durationOperationsJson, ownerUserId, userJson
+                ) VALUES (0, 'legacy-request', 'device-legacy', 0, 'ReplaceRemote',
+                    '[]', '[]', '[]', 'user-1', '{}')""",
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MigrationDatabaseName,
+            6,
+            true,
+            PomodoroughDatabase.Migration5To6,
+        )
+
+        migrated.query("SELECT canonicalAutoStartBreaks FROM local_state").use {
+            assertTrue(it.moveToFirst())
+            assertEquals(0, it.getInt(0))
+        }
+        migrated.query("SELECT COUNT(*) FROM pending_auto_start_operations").use {
+            assertTrue(it.moveToFirst())
+            assertEquals(0, it.getInt(0))
+        }
+        migrated.query("SELECT autoStartOperationsJson FROM pending_bootstrap_resolution").use {
+            assertTrue(it.moveToFirst())
+            assertNull(it.getString(0))
+        }
+        migrated.close()
+    }
+
+    @Test
+    fun migrationSixToSevenPreservesCommandsAndOwnsLatestPendingStart() {
+        context.deleteDatabase(MigrationDatabaseName)
+        migrationHelper.createDatabase(MigrationDatabaseName, 6).apply {
+            execSQL(
+                """INSERT INTO local_state (
+                    id, deviceId, deviceSequence, hlcWallMs, hlcCounter, revision,
+                    canonicalTimerJson, historyJson, settingsJson, userJson, ownerUserId,
+                    tasksJson, knownTasksJson, selectedTaskId, canonicalAutoStartBreaks
+                ) VALUES (0, 'device-1', 2, 102, 0, 0, NULL, '[]', '{}', NULL,
+                    NULL, '[]', '[]', NULL, 1)""",
+            )
+            execSQL(
+                """INSERT INTO pending_commands (
+                    id, deviceSequence, timerId, type, phase, plannedDurationMs,
+                    occurredAt, hlcWallMs, hlcCounter, observedElapsedMs, taskId
+                ) VALUES ('start-1', 1, 'timer-1', 'start', 'focus', 1500000,
+                    '2026-01-01T00:00:00Z', 101, 0, 0, NULL)""",
+            )
+            execSQL(
+                """INSERT INTO pending_commands (
+                    id, deviceSequence, timerId, type, phase, plannedDurationMs,
+                    occurredAt, hlcWallMs, hlcCounter, observedElapsedMs, taskId
+                ) VALUES ('start-2', 2, 'timer-2', 'start', 'short_break', 300000,
+                    '2026-01-01T00:01:00Z', 102, 0, 0, NULL)""",
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MigrationDatabaseName,
+            7,
+            true,
+            PomodoroughDatabase.Migration6To7,
+        )
+
+        migrated.query("SELECT ownedTimerId FROM local_state").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("timer-2", it.getString(0))
+        }
+        migrated.query(
+            "SELECT id, generatedByFinishCommandId FROM pending_commands ORDER BY deviceSequence",
+        ).use {
+            assertTrue(it.moveToFirst())
+            assertEquals("start-1", it.getString(0))
+            assertNull(it.getString(1))
+            assertTrue(it.moveToNext())
+            assertEquals("start-2", it.getString(0))
+            assertNull(it.getString(1))
+        }
+        migrated.close()
+    }
+
+    @Test
+    fun migrationSixToSevenKeepsGeneratedLookingBreakChainIndependentAcrossDifferentClockMilliseconds() {
+        context.deleteDatabase(MigrationDatabaseName)
+        migrationHelper.createDatabase(MigrationDatabaseName, 6).apply {
+            execSQL(
+                """INSERT INTO local_state (
+                    id, deviceId, deviceSequence, hlcWallMs, hlcCounter, revision,
+                    canonicalTimerJson, historyJson, settingsJson, userJson, ownerUserId,
+                    tasksJson, knownTasksJson, selectedTaskId, canonicalAutoStartBreaks
+                ) VALUES (0, 'device-1', 4, 103, 0, 0, NULL, '[]', '{}', NULL,
+                    NULL, '[]', '[]', NULL, 1)""",
+            )
+            execSQL(
+                """INSERT INTO pending_commands (
+                    id, deviceSequence, timerId, type, phase, plannedDurationMs,
+                    occurredAt, hlcWallMs, hlcCounter, observedElapsedMs, taskId
+                ) VALUES ('finish-focus', 1, 'focus-1', 'finish', 'focus', 1500000,
+                    '2026-01-01T00:25:00.100Z', 100, 4, 1500000, NULL)""",
+            )
+            execSQL(
+                """INSERT INTO pending_commands (
+                    id, deviceSequence, timerId, type, phase, plannedDurationMs,
+                    occurredAt, hlcWallMs, hlcCounter, observedElapsedMs, taskId
+                ) VALUES ('generated-break', 2, 'break-1', 'start', 'short_break', 300000,
+                    '2026-01-01T00:25:00.137Z', 101, 0, 0, NULL)""",
+            )
+            execSQL(
+                """INSERT INTO pending_commands (
+                    id, deviceSequence, timerId, type, phase, plannedDurationMs,
+                    occurredAt, hlcWallMs, hlcCounter, observedElapsedMs, taskId
+                ) VALUES ('pause-break', 3, 'break-1', 'pause', 'short_break', 300000,
+                    '2026-01-01T00:26:00Z', 102, 0, 60000, NULL)""",
+            )
+            execSQL(
+                """INSERT INTO pending_commands (
+                    id, deviceSequence, timerId, type, phase, plannedDurationMs,
+                    occurredAt, hlcWallMs, hlcCounter, observedElapsedMs, taskId
+                ) VALUES ('manual-focus', 4, 'focus-2', 'start', 'focus', 1500000,
+                    '2026-01-01T00:27:00Z', 103, 0, 0, NULL)""",
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MigrationDatabaseName,
+            7,
+            true,
+            PomodoroughDatabase.Migration6To7,
+        )
+
+        migrated.query(
+            """SELECT id, generatedByFinishCommandId FROM pending_commands
+                ORDER BY deviceSequence""",
+        ).use {
+            assertTrue(it.moveToFirst())
+            assertEquals("finish-focus", it.getString(0))
+            assertNull(it.getString(1))
+            assertTrue(it.moveToNext())
+            assertEquals("generated-break", it.getString(0))
+            assertNull(it.getString(1))
+            assertTrue(it.moveToNext())
+            assertEquals("pause-break", it.getString(0))
+            assertNull(it.getString(1))
+            assertTrue(it.moveToNext())
+            assertEquals("manual-focus", it.getString(0))
+            assertNull(it.getString(1))
+        }
+        migrated.query("SELECT ownedTimerId FROM local_state").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("focus-2", it.getString(0))
+        }
+        migrated.close()
+    }
+
+    @Test
+    fun migrationSixToSevenDoesNotCaptureAdjacentManualFocusStart() {
+        context.deleteDatabase(MigrationDatabaseName)
+        migrationHelper.createDatabase(MigrationDatabaseName, 6).apply {
+            execSQL(
+                """INSERT INTO local_state (
+                    id, deviceId, deviceSequence, hlcWallMs, hlcCounter, revision,
+                    canonicalTimerJson, historyJson, settingsJson, userJson, ownerUserId,
+                    tasksJson, knownTasksJson, selectedTaskId, canonicalAutoStartBreaks
+                ) VALUES (0, 'device-1', 2, 101, 0, 0, NULL, '[]', '{}', NULL,
+                    NULL, '[]', '[]', NULL, 1)""",
+            )
+            execSQL(
+                """INSERT INTO pending_commands (
+                    id, deviceSequence, timerId, type, phase, plannedDurationMs,
+                    occurredAt, hlcWallMs, hlcCounter, observedElapsedMs, taskId
+                ) VALUES ('finish-focus', 1, 'focus-1', 'finish', 'focus', 1500000,
+                    '2026-01-01T00:25:00.100Z', 100, 0, 1500000, NULL)""",
+            )
+            execSQL(
+                """INSERT INTO pending_commands (
+                    id, deviceSequence, timerId, type, phase, plannedDurationMs,
+                    occurredAt, hlcWallMs, hlcCounter, observedElapsedMs, taskId
+                ) VALUES ('manual-focus', 2, 'focus-2', 'start', 'focus', 1500000,
+                    '2026-01-01T00:25:00.200Z', 101, 0, 0, NULL)""",
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MigrationDatabaseName,
+            7,
+            true,
+            PomodoroughDatabase.Migration6To7,
+        )
+
+        migrated.query(
+            """SELECT id, generatedByFinishCommandId FROM pending_commands
+                ORDER BY deviceSequence""",
+        ).use {
+            assertTrue(it.moveToFirst())
+            assertEquals("finish-focus", it.getString(0))
+            assertNull(it.getString(1))
+            assertTrue(it.moveToNext())
+            assertEquals("manual-focus", it.getString(0))
+            assertNull(it.getString(1))
+        }
+        migrated.close()
+    }
+
+    @Test
+    fun migrationSixToSevenKeepsAdjacentManualBreakIndependentWhenLegacySettingIsEnabled() {
+        context.deleteDatabase(MigrationDatabaseName)
+        migrationHelper.createDatabase(MigrationDatabaseName, 6).apply {
+            execSQL(
+                """INSERT INTO local_state (
+                    id, deviceId, deviceSequence, hlcWallMs, hlcCounter, revision,
+                    canonicalTimerJson, historyJson, settingsJson, userJson, ownerUserId,
+                    tasksJson, knownTasksJson, selectedTaskId, canonicalAutoStartBreaks
+                ) VALUES (0, 'device-1', 2, 101, 0, 0, NULL, '[]',
+                    '{"autoStartBreaks":true}', NULL, NULL, '[]', '[]', NULL, 1)""",
+            )
+            execSQL(
+                """INSERT INTO pending_commands (
+                    id, deviceSequence, timerId, type, phase, plannedDurationMs,
+                    occurredAt, hlcWallMs, hlcCounter, observedElapsedMs, taskId
+                ) VALUES ('finish-focus', 1, 'focus-1', 'finish', 'focus', 1500000,
+                    '2026-01-01T00:25:00.100Z', 100, 0, 1500000, NULL)""",
+            )
+            execSQL(
+                """INSERT INTO pending_commands (
+                    id, deviceSequence, timerId, type, phase, plannedDurationMs,
+                    occurredAt, hlcWallMs, hlcCounter, observedElapsedMs, taskId
+                ) VALUES ('manual-break', 2, 'break-1', 'start', 'short_break', 300000,
+                    '2026-01-01T00:25:00.200Z', 101, 0, 0, NULL)""",
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MigrationDatabaseName,
+            7,
+            true,
+            PomodoroughDatabase.Migration6To7,
+        )
+
+        migrated.query(
+            """SELECT id, generatedByFinishCommandId FROM pending_commands
+                ORDER BY deviceSequence""",
+        ).use {
+            assertTrue(it.moveToFirst())
+            assertEquals("finish-focus", it.getString(0))
+            assertNull(it.getString(1))
+            assertTrue(it.moveToNext())
+            assertEquals("manual-break", it.getString(0))
+            assertNull(it.getString(1))
+        }
+        migrated.close()
+    }
+
     private fun state() = LocalStateEntity(
         deviceId = "device-1",
         settingsJson = "{}",
@@ -404,6 +772,15 @@ class PomodoroughDatabaseTest {
         id = id,
         phase = phase,
         durationMs = durationMs,
+        occurredAt = "2026-01-01T00:00:00Z",
+        hlcWallMs = wall,
+        hlcCounter = 0,
+    )
+
+    private fun autoStartOperation(id: String, enabled: Boolean, wall: Long) = AutoStartOperation(
+        id = id,
+        deviceId = "device-1",
+        enabled = enabled,
         occurredAt = "2026-01-01T00:00:00Z",
         hlcWallMs = wall,
         hlcCounter = 0,

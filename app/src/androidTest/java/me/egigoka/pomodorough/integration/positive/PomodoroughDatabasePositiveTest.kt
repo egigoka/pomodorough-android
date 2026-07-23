@@ -5,6 +5,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import kotlinx.coroutines.runBlocking
+import me.egigoka.pomodorough.data.AutoStartOperation
 import me.egigoka.pomodorough.data.CommandType
 import me.egigoka.pomodorough.data.TimerCommand
 import me.egigoka.pomodorough.data.TimerPhase
@@ -56,6 +57,35 @@ class PomodoroughDatabasePositiveTest {
         assertEquals(listOf(first, second), database.timerDao().pendingCommands())
     }
 
+    @Test
+    fun autoStartCanonicalAndQueueSurviveDatabaseReopen() = runBlocking {
+        val state = LocalStateEntity(
+            deviceId = "device-1",
+            hlcWallMs = 102,
+            canonicalAutoStartBreaks = true,
+            settingsJson = "{}",
+        )
+        val operations = listOf(
+            autoStartOperation("00000000-0000-4000-8000-000000000002", false, 102),
+            autoStartOperation("00000000-0000-4000-8000-000000000001", true, 101),
+        )
+        database.timerDao().insertState(state)
+        operations.forEach {
+            database.timerDao().insertAutoStartOperation(
+                me.egigoka.pomodorough.data.local.PendingAutoStartOperationEntity.from(it),
+            )
+        }
+
+        database.close()
+        database = openDatabase()
+
+        assertEquals(state, database.timerDao().localState())
+        assertEquals(
+            operations.sortedBy { it.hlcWallMs },
+            database.timerDao().pendingAutoStartOperations().map { it.toModel() },
+        )
+    }
+
     private fun openDatabase() = Room.databaseBuilder(
         context,
         PomodoroughDatabase::class.java,
@@ -65,6 +95,8 @@ class PomodoroughDatabasePositiveTest {
         PomodoroughDatabase.Migration2To3,
         PomodoroughDatabase.Migration3To4,
         PomodoroughDatabase.Migration4To5,
+        PomodoroughDatabase.Migration5To6,
+        PomodoroughDatabase.Migration6To7,
     ).build()
 
     private fun command(sequence: Long) = TimerCommand(
@@ -78,6 +110,15 @@ class PomodoroughDatabasePositiveTest {
         hlcWallMs = 100 + sequence,
         hlcCounter = 0,
         observedElapsedMs = 0,
+    )
+
+    private fun autoStartOperation(id: String, enabled: Boolean, wall: Long) = AutoStartOperation(
+        id = id,
+        deviceId = "device-1",
+        enabled = enabled,
+        occurredAt = "2026-01-01T00:00:00Z",
+        hlcWallMs = wall,
+        hlcCounter = 0,
     )
 
     private companion object {

@@ -16,6 +16,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.encodeToString
 import me.egigoka.pomodorough.data.Acknowledgement
+import me.egigoka.pomodorough.data.AutoStartAcknowledgement
+import me.egigoka.pomodorough.data.AutoStartOperation
 import me.egigoka.pomodorough.data.AuthStatus
 import me.egigoka.pomodorough.data.BootstrapResolutionRequest
 import me.egigoka.pomodorough.data.BootstrapStrategy
@@ -29,11 +31,13 @@ import me.egigoka.pomodorough.data.TaskAcknowledgement
 import me.egigoka.pomodorough.data.TaskOperation
 import me.egigoka.pomodorough.data.TaskOperationType
 import me.egigoka.pomodorough.data.TimerPhase
+import me.egigoka.pomodorough.data.TimerSettings
 import me.egigoka.pomodorough.data.TimerStatus
 import me.egigoka.pomodorough.data.TokenPair
 import me.egigoka.pomodorough.data.auth.AuthenticationRequired
 import me.egigoka.pomodorough.data.api.ApiException
 import me.egigoka.pomodorough.data.local.PendingBootstrapResolutionEntity
+import me.egigoka.pomodorough.data.local.PendingAutoStartOperationEntity
 import me.egigoka.pomodorough.data.local.PendingCommandEntity
 import me.egigoka.pomodorough.data.local.PendingDurationOperationEntity
 import me.egigoka.pomodorough.data.local.PendingTaskOperationEntity
@@ -1224,6 +1228,226 @@ class BootstrapResolutionTest {
         assertTrue(database.timerDao().pendingCommands().isEmpty())
     }
 
+    @Test
+    fun legacyOmittedAutoStartOperationsPreservesQueueAndRebasesOverRemote() = runBlocking {
+        val profile = testUser("legacy-auto-owner")
+        val operation = testAutoStartOperation(
+            id = "00000000-0000-4000-8000-000000000001",
+            enabled = true,
+        )
+        database.timerDao().insertState(testState(user = profile))
+        database.timerDao().insertAutoStartOperation(PendingAutoStartOperationEntity.from(operation))
+        database.timerDao().upsertBootstrapResolution(
+            PendingBootstrapResolutionEntity(
+                requestId = "legacy-auto-request",
+                deviceId = "device-1",
+                expectedRevision = 1,
+                strategy = BootstrapStrategy.Merge.name,
+                commandsJson = "[]",
+                taskOperationsJson = "[]",
+                durationOperationsJson = "[]",
+                ownerUserId = profile.id,
+                userJson = repositoryJson.encodeToString(profile),
+                autoStartOperationsJson = null,
+            ),
+        )
+        val syncStarted = CompletableDeferred<Unit>()
+        val releaseSync = CompletableDeferred<Unit>()
+        val service = TestRepositoryService(profile).apply {
+            bootstrapResponse = response(revision = 1, autoStartBreaks = false)
+            resolveHandler = { request ->
+                response(revision = 2, autoStartBreaks = false).copy(
+                    autoStartAcknowledgements = emptyList(),
+                )
+            }
+            syncHandler = { request ->
+                syncStarted.complete(Unit)
+                releaseSync.await()
+                response(revision = 3, autoStartBreaks = true).copy(
+                    autoStartAcknowledgements = request.autoStartOperations.map {
+                        AutoStartAcknowledgement(it.id, "applied", "")
+                    },
+                )
+            }
+        }
+        val repository = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+
+        repository.initialize()
+        repository.resolveHistory(BootstrapStrategy.Merge)
+        syncStarted.await()
+
+        assertNull(service.resolutionRequests.single().autoStartOperations)
+        assertEquals(operation.id, database.timerDao().pendingAutoStartOperations().single().id)
+        assertTrue(repository.state.value.settings.autoStartBreaks)
+        assertNull(database.timerDao().pendingBootstrapResolution())
+
+        releaseSync.complete(Unit)
+        awaitState { repository.state.value.pendingCount == 0 }
+        assertTrue(database.timerDao().pendingAutoStartOperations().isEmpty())
+        assertEquals(listOf(operation), service.syncRequests.single().autoStartOperations)
+    }
+
+    @Test
+    fun explicitEmptyAutoStartOperationsClearsLocalValueForKeepRemoteAndReplace() = runBlocking {
+        for (strategy in listOf(BootstrapStrategy.KeepRemote, BootstrapStrategy.ReplaceRemote)) {
+            if (strategy == BootstrapStrategy.ReplaceRemote) resetDatabase()
+            val localHistory = testHistory("local-${strategy.name}")
+            val remoteHistory = testHistory("remote-${strategy.name}")
+            val operation = testAutoStartOperation(
+                id = if (strategy == BootstrapStrategy.KeepRemote) {
+                    "00000000-0000-4000-8000-000000000001"
+                } else {
+                    "00000000-0000-4000-8000-000000000002"
+                },
+                enabled = true,
+            )
+            database.timerDao().insertState(
+                testState(
+                    history = listOf(localHistory),
+                    settings = TimerSettings(autoStartBreaks = strategy == BootstrapStrategy.ReplaceRemote),
+                ),
+            )
+            if (strategy == BootstrapStrategy.KeepRemote) {
+                database.timerDao().insertAutoStartOperation(PendingAutoStartOperationEntity.from(operation))
+            }
+            val service = TestRepositoryService().apply {
+                bootstrapResponse = response(revision = 1, history = listOf(remoteHistory))
+                resolveHandler = { request ->
+                    acknowledgedResolution(request, response(revision = 2))
+                }
+            }
+            val repository = testRepository(
+                context,
+                database.timerDao(),
+                service,
+                TestAuthSession(tokensAvailable = true),
+            )
+            repository.initialize()
+
+            repository.resolveHistory(strategy)
+
+            val sent = service.resolutionRequests.single().autoStartOperations
+            assertTrue(requireNotNull(sent).isEmpty())
+            assertTrue(database.timerDao().pendingAutoStartOperations().isEmpty())
+            assertTrue(!repository.state.value.settings.autoStartBreaks)
+        }
+    }
+
+    @Test
+    fun mergeCapturesAutoStartPresenceAndExactRetryPayload() = runBlocking {
+        val localHistory = testHistory("local-auto-merge")
+        val remoteHistory = testHistory("remote-auto-merge")
+        val operation = testAutoStartOperation(
+            id = "00000000-0000-4000-8000-000000000001",
+            enabled = true,
+        )
+        database.timerDao().insertState(testState(history = listOf(localHistory)))
+        database.timerDao().insertAutoStartOperation(PendingAutoStartOperationEntity.from(operation))
+        val service = TestRepositoryService().apply {
+            bootstrapResponse = response(revision = 4, history = listOf(remoteHistory))
+            resolveFailure = IOException("lost merge response")
+        }
+        val first = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+        first.initialize()
+        first.resolveHistory(BootstrapStrategy.Merge)
+        val captured = service.resolutionRequests.single()
+
+        assertEquals(listOf(operation), captured.autoStartOperations)
+        assertEquals(
+            repositoryJson.encodeToString(listOf(operation)),
+            database.timerDao().pendingBootstrapResolution()?.autoStartOperationsJson,
+        )
+
+        service.resolveFailure = null
+        service.resolveHandler = { request ->
+            acknowledgedResolution(
+                request,
+                response(revision = 5, autoStartBreaks = true),
+            )
+        }
+        val restarted = testRepository(
+            context,
+            database.timerDao(),
+            service,
+            TestAuthSession(tokensAvailable = true),
+        )
+        restarted.initialize()
+        restarted.resolveHistory(BootstrapStrategy.Merge)
+
+        assertEquals(captured, service.resolutionRequests.last())
+        assertTrue(database.timerDao().pendingAutoStartOperations().isEmpty())
+        assertTrue(restarted.state.value.settings.autoStartBreaks)
+    }
+
+    @Test
+    fun bootstrapAutoStartLimitAllows4096AndRejects4097WithoutMutation() = runBlocking {
+        val localHistory = testHistory("local-auto-limit")
+        val remoteHistory = testHistory("remote-auto-limit")
+        val operations = (1..4_097).map { index ->
+            testAutoStartOperation(
+                id = "00000000-0000-4000-8000-${index.toString().padStart(12, '0')}",
+                enabled = index % 2 == 1,
+                wallMs = 1_767_225_600_000 + index,
+            )
+        }
+        database.timerDao().insertState(testState(history = listOf(localHistory)))
+        database.withTransaction {
+            operations.take(4_096).forEach {
+                database.timerDao().insertAutoStartOperation(PendingAutoStartOperationEntity.from(it))
+            }
+        }
+        val acceptedService = TestRepositoryService().apply {
+            bootstrapResponse = response(revision = 1, history = listOf(remoteHistory))
+            resolveHandler = { request ->
+                acknowledgedResolution(request, response(revision = 2, autoStartBreaks = false))
+            }
+        }
+        val accepted = testRepository(
+            context,
+            database.timerDao(),
+            acceptedService,
+            TestAuthSession(tokensAvailable = true),
+        )
+        accepted.initialize()
+        accepted.resolveHistory(BootstrapStrategy.Merge)
+
+        assertEquals(4_096, acceptedService.resolutionRequests.single().autoStartOperations?.size)
+        assertTrue(database.timerDao().pendingAutoStartOperations().isEmpty())
+
+        resetDatabase()
+        database.timerDao().insertState(testState(history = listOf(localHistory)))
+        database.withTransaction {
+            operations.forEach {
+                database.timerDao().insertAutoStartOperation(PendingAutoStartOperationEntity.from(it))
+            }
+        }
+        val blockedService = TestRepositoryService().apply {
+            bootstrapResponse = response(revision = 1, history = listOf(remoteHistory))
+        }
+        val blocked = testRepository(
+            context,
+            database.timerDao(),
+            blockedService,
+            TestAuthSession(tokensAvailable = true),
+        )
+        blocked.initialize()
+        blocked.resolveHistory(BootstrapStrategy.Merge)
+
+        assertTrue(blockedService.resolutionRequests.isEmpty())
+        assertEquals(4_097, database.timerDao().pendingAutoStartOperations().size)
+        assertEquals(ResolutionRecovery.KeepRemote, blocked.state.value.historyResolution?.recovery)
+    }
+
     private fun completedLocalCommands() = listOf(
         testCommand("command-start", sequence = 1, timerId = "timer-local", type = CommandType.Start),
         testCommand("command-finish", sequence = 2, timerId = "timer-local", type = CommandType.Finish),
@@ -1288,6 +1512,9 @@ class BootstrapResolutionTest {
         },
         durationAcknowledgements = request.durationOperations.map {
             DurationAcknowledgement(it.id, "applied", "")
+        },
+        autoStartAcknowledgements = request.autoStartOperations.orEmpty().map {
+            AutoStartAcknowledgement(it.id, "applied", "")
         },
     )
 
@@ -1428,6 +1655,7 @@ class BootstrapResolutionTest {
         history: List<me.egigoka.pomodorough.data.HistoryItem> = emptyList(),
         tasks: List<FocusTask> = emptyList(),
         durations: DurationsMs = DurationsMs(),
+        autoStartBreaks: Boolean = false,
     ) = SyncResponse(
         acknowledgements = emptyList(),
         revision = revision,
@@ -1440,5 +1668,6 @@ class BootstrapResolutionTest {
         durationsMs = durations,
         taskAcknowledgements = emptyList(),
         tasks = tasks,
+        autoStartBreaks = autoStartBreaks,
     )
 }

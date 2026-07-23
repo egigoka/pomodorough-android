@@ -37,6 +37,7 @@ import me.egigoka.pomodorough.data.api.PomodoroughService
 import me.egigoka.pomodorough.data.auth.AuthSession
 import me.egigoka.pomodorough.data.auth.AuthenticationRequired
 import me.egigoka.pomodorough.data.local.LocalStateEntity
+import me.egigoka.pomodorough.data.local.PendingAutoStartOperationEntity
 import me.egigoka.pomodorough.data.local.PendingBootstrapResolutionEntity
 import me.egigoka.pomodorough.data.local.PendingCommandEntity
 import me.egigoka.pomodorough.data.local.PendingDurationOperationEntity
@@ -83,6 +84,12 @@ private data class BootstrapResolutionAttempt(
     val request: BootstrapResolutionRequest,
 )
 
+private data class GeneratedCommandResolution(
+    val released: List<TimerCommand>,
+    val discarded: List<TimerCommand>,
+    val discardedSourceTimerIds: Set<String>,
+)
+
 private data class PendingAccountSwitch(
     val profile: User,
     val bootstrap: SyncResponse,
@@ -120,12 +127,15 @@ class TimerRepository(
 
     private lateinit var local: LocalStateEntity
     private var pending = emptyList<TimerCommand>()
+    private var commandDependencies = emptyMap<String, String>()
     private var pendingDurationOperations = emptyList<DurationOperation>()
     private var pendingTaskOperations = emptyList<TaskOperation>()
+    private var pendingAutoStartOperations = emptyList<AutoStartOperation>()
     private var pendingBootstrapResolution: PendingBootstrapResolutionEntity? = null
     private var canonicalTimer: CanonicalTimer? = null
     private var canonicalHistory = emptyList<HistoryItem>()
     private var canonicalTasks = emptyList<FocusTask>()
+    private var canonicalAutoStartBreaks = false
     private var knownTasks = emptyMap<String, FocusTask>()
     private var tasks = emptyList<FocusTask>()
     private var projection = TimerProjection(null, emptyList())
@@ -152,12 +162,14 @@ class TimerRepository(
 
     init {
         scope.launch { syncLoop() }
-        connectivity.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = updateNetworkState()
-            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) =
-                updateNetworkState()
-            override fun onLost(network: Network) = updateNetworkState()
-        })
+        if (networkAvailable == null) {
+            connectivity.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = updateNetworkState()
+                override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) =
+                    updateNetworkState()
+                override fun onLost(network: Network) = updateNetworkState()
+            })
+        }
     }
 
     suspend fun initialize() {
@@ -182,10 +194,28 @@ class TimerRepository(
                 deviceId = UUID.randomUUID().toString(),
                 settingsJson = json.encodeToString(TimerSettings()),
             ).also { dao.insertState(it) }
-            pending = dao.pendingCommands().map(PendingCommandEntity::toModel)
+            val pendingCommandEntities = dao.pendingCommands()
+            pending = pendingCommandEntities.map(PendingCommandEntity::toModel)
+            commandDependencies = pendingCommandEntities.mapNotNull { entity ->
+                entity.generatedByFinishCommandId?.let { entity.id to it }
+            }.toMap()
+            val pendingById = pending.associateBy(TimerCommand::id)
+            val invalidDependentEntities = pendingCommandEntities.filter { entity ->
+                val sourceId = entity.generatedByFinishCommandId ?: return@filter false
+                val source = pendingById[sourceId]
+                source?.type != CommandType.Finish || entity.deviceSequence <= source.deviceSequence
+            }
+            if (invalidDependentEntities.isNotEmpty()) {
+                dao.deleteCommands(invalidDependentEntities)
+                val invalidIds = invalidDependentEntities.map(PendingCommandEntity::id).toSet()
+                pending = pending.filterNot { it.id in invalidIds }
+                commandDependencies = commandDependencies - invalidIds
+            }
             pendingDurationOperations = dao.pendingDurationOperations()
                 .map(PendingDurationOperationEntity::toModel)
             pendingTaskOperations = dao.pendingTaskOperations().map(PendingTaskOperationEntity::toModel)
+            pendingAutoStartOperations = dao.pendingAutoStartOperations()
+                .map(PendingAutoStartOperationEntity::toModel)
             pendingBootstrapResolution = dao.pendingBootstrapResolution()
             val highestSequence = pending.maxOfOrNull(TimerCommand::deviceSequence) ?: 0
             if (highestSequence > local.deviceSequence) {
@@ -194,6 +224,13 @@ class TimerRepository(
             }
             settings = decodeOr(local.settingsJson, TimerSettings())
             settings = replayDurationOperations(settings, pendingDurationOperations)
+            canonicalAutoStartBreaks = local.canonicalAutoStartBreaks
+            settings = settings.copy(
+                autoStartBreaks = replayAutoStartOperations(
+                    canonicalAutoStartBreaks,
+                    pendingAutoStartOperations,
+                ),
+            )
             canonicalTimer = local.canonicalTimerJson?.let { decodeOr<CanonicalTimer?>(it, null) }
             canonicalHistory = decodeOr(local.historyJson, emptyList())
             canonicalTasks = decodeOr(local.tasksJson, emptyList())
@@ -215,6 +252,12 @@ class TimerRepository(
                 dao.updateState(local)
             }
             rebuildProjections()
+            if (local.ownedTimerId != null &&
+                projection.timer?.takeIf { it.status in activeStatuses }?.id != local.ownedTimerId
+            ) {
+                local = local.copy(ownedTimerId = null)
+                dao.updateState(local)
+            }
             authStatus = if (ownerMigrationCorrupted) {
                 AuthStatus.SignedOut
             } else if (auth.hasTokens()) {
@@ -316,7 +359,7 @@ class TimerRepository(
                     publish()
                     return@withLock
                 }
-                val clearedSettings = settings.withDurations(DurationsMs())
+                val clearedSettings = settings.withDurations(DurationsMs()).copy(autoStartBreaks = false)
                 val nextLocal = local.copy(
                     revision = 0,
                     canonicalTimerJson = null,
@@ -327,6 +370,8 @@ class TimerRepository(
                     settingsJson = json.encodeToString(clearedSettings),
                     userJson = null,
                     ownerUserId = null,
+                    canonicalAutoStartBreaks = false,
+                    ownedTimerId = null,
                 )
                 dao.clearAccount(nextLocal)
                 local = nextLocal
@@ -337,9 +382,12 @@ class TimerRepository(
                 tasks = emptyList()
                 projection = TimerProjection(null, emptyList())
                 pending = emptyList()
+                commandDependencies = emptyMap()
                 pendingDurationOperations = emptyList()
                 pendingTaskOperations = emptyList()
+                pendingAutoStartOperations = emptyList()
                 settings = clearedSettings
+                canonicalAutoStartBreaks = false
                 user = null
                 pendingBootstrapResolution = null
                 historyResolution = null
@@ -448,11 +496,7 @@ class TimerRepository(
 
     suspend fun finishTimer() {
         initialize()
-        val phase = projection.timer?.phase
-        if (!issueCommand(CommandType.Finish)) return
-        if (phase == TimerPhase.Focus && settings.autoStartBreaks) {
-            issueCommand(CommandType.Start, nextBreakPhase())
-        }
+        finishLocalTimer(onlyIfExpired = false, allowWhileLoading = false)
     }
 
     suspend fun cancelTimer() {
@@ -514,7 +558,37 @@ class TimerRepository(
 
     suspend fun setAutoStart(enabled: Boolean) {
         initialize()
-        persistSettings(settings.copy(autoStartBreaks = enabled))
+        var saved = false
+        actionMutex.withLock {
+            if (mutationsBlocked() || settings.autoStartBreaks == enabled) return@withLock
+            val now = System.currentTimeMillis()
+            val wallMs = maxOf(now, local.hlcWallMs, 1L)
+            val counter = if (wallMs == local.hlcWallMs) local.hlcCounter + 1 else 0
+            val operation = AutoStartOperation(
+                id = UUID.randomUUID().toString(),
+                deviceId = local.deviceId,
+                enabled = enabled,
+                occurredAt = Instant.ofEpochMilli(now).toString(),
+                hlcWallMs = wallMs,
+                hlcCounter = counter,
+            )
+            val nextSettings = settings.copy(autoStartBreaks = enabled)
+            val nextLocal = local.copy(
+                hlcWallMs = wallMs,
+                hlcCounter = counter,
+                settingsJson = json.encodeToString(nextSettings),
+            )
+            dao.persistAutoStartOperation(
+                PendingAutoStartOperationEntity.from(operation),
+                nextLocal,
+            )
+            local = nextLocal
+            settings = nextSettings
+            pendingAutoStartOperations = pendingAutoStartOperations + operation
+            publish()
+            saved = true
+        }
+        if (saved) requestSync()
     }
 
     suspend fun selectTask(taskId: String?) {
@@ -556,12 +630,7 @@ class TimerRepository(
         if (timer.status == TimerStatus.Running &&
             TimerReducer.elapsedAt(timer) >= timer.plannedDurationMs
         ) {
-            val phase = timer.phase
-            if (!issueCommand(CommandType.Finish)) return false
-            if (phase == TimerPhase.Focus && settings.autoStartBreaks) {
-                issueCommand(CommandType.Start, nextBreakPhase())
-            }
-            return true
+            return finishLocalTimer(onlyIfExpired = true, allowWhileLoading = true)
         }
         return false
     }
@@ -732,14 +801,16 @@ class TimerRepository(
         bootstrap: SyncResponse,
     ): BootstrapResolutionAttempt? {
         val includeLocal = strategy != BootstrapStrategy.KeepRemote
+        val eligibleCommands = eligiblePendingCommands()
         val request = BootstrapResolutionRequest(
             requestId = "bootstrap-${UUID.randomUUID()}",
             deviceId = local.deviceId,
             expectedRevision = bootstrap.revision,
             strategy = strategy,
-            commands = pending.takeIf { includeLocal }.orEmpty(),
+            commands = eligibleCommands.takeIf { includeLocal }.orEmpty(),
             taskOperations = pendingTaskOperations.takeIf { includeLocal }.orEmpty(),
             durationOperations = pendingDurationOperations.takeIf { includeLocal }.orEmpty(),
+            autoStartOperations = pendingAutoStartOperations.takeIf { includeLocal }.orEmpty(),
         )
         val validationError = runCatching { validateResolutionEnvelope(request) }.exceptionOrNull()
         if (validationError != null) {
@@ -775,6 +846,7 @@ class TimerRepository(
         try {
             val response = auth.authorized { api.resolveBootstrap(it, attempt.request) }
             var applied = false
+            var shouldSyncRetainedOperations = false
             actionMutex.withLock {
                 if (!isCurrent(identity) || authStatus != AuthStatus.SignedIn) return@withLock
                 validateCanonicalResponse(response, "Bootstrap resolution")
@@ -796,10 +868,20 @@ class TimerRepository(
                     response.durationAcknowledgements.map(DurationAcknowledgement::operationId),
                     "duration",
                 )
+                validateAcknowledgements(
+                    attempt.request.autoStartOperations.orEmpty().map(AutoStartOperation::id),
+                    response.autoStartAcknowledgements.map(AutoStartAcknowledgement::operationId),
+                    "auto-start",
+                )
                 applyBootstrapResolution(attempt.request, response)
                 applied = true
+                shouldSyncRetainedOperations = pendingAutoStartOperations.isNotEmpty() ||
+                    eligiblePendingCommands().isNotEmpty()
             }
-            if (applied && foreground) openRevisionStream()
+            if (applied) {
+                if (shouldSyncRetainedOperations) requestSync(force = true)
+                if (foreground) openRevisionStream()
+            }
         } catch (error: BootstrapConflictException) {
             actionMutex.withLock {
                 if (!isCurrent(identity)) return@withLock
@@ -1017,6 +1099,8 @@ class TimerRepository(
         }
         val retainedDurationOperations = if (clearLocal) emptyList() else pendingDurationOperations
         val retainedTaskOperations = if (clearLocal) emptyList() else pendingTaskOperations
+        val retainedAutoStartOperations = if (clearLocal) emptyList() else pendingAutoStartOperations
+        val retainedCommands = if (clearLocal) emptyList() else pending
         val nextKnownTasks = if (clearLocal) {
             response.tasks.associateBy(FocusTask::id)
         } else {
@@ -1026,6 +1110,16 @@ class TimerRepository(
         val nextSettings = replayDurationOperations(
             settings.withDurations(response.durationsMs),
             retainedDurationOperations,
+        ).copy(
+            autoStartBreaks = replayAutoStartOperations(
+                response.autoStartBreaks,
+                retainedAutoStartOperations,
+            ),
+        )
+        val nextProjection = TimerReducer.replay(
+            response.canonicalTimer,
+            response.history,
+            retainedCommands,
         )
         val (mergedWall, mergedCounter) = mergedClock(response)
         val nextLocal = local.copy(
@@ -1042,6 +1136,12 @@ class TimerRepository(
             ownerUserId = profile.id,
             hlcWallMs = mergedWall,
             hlcCounter = mergedCounter,
+            canonicalAutoStartBreaks = response.autoStartBreaks,
+            ownedTimerId = local.ownedTimerId?.takeIf {
+                !clearLocal &&
+                    nextProjection.timer?.status in activeStatuses &&
+                    nextProjection.timer?.id == it
+            },
         )
         if (clearLocal) dao.clearAccount(nextLocal) else dao.updateState(nextLocal)
         local = nextLocal
@@ -1049,11 +1149,14 @@ class TimerRepository(
         canonicalTimer = response.canonicalTimer
         canonicalHistory = response.history
         canonicalTasks = response.tasks
+        canonicalAutoStartBreaks = response.autoStartBreaks
         knownTasks = nextKnownTasks
         if (clearLocal) {
             pending = emptyList()
             pendingDurationOperations = emptyList()
             pendingTaskOperations = emptyList()
+            pendingAutoStartOperations = emptyList()
+            commandDependencies = emptyMap()
             pendingBootstrapResolution = null
         }
         historyResolution = null
@@ -1066,6 +1169,95 @@ class TimerRepository(
         local = local.copy(settingsJson = json.encodeToString(settings))
         dao.updateState(local)
         publish()
+    }
+
+    private suspend fun finishLocalTimer(
+        onlyIfExpired: Boolean,
+        allowWhileLoading: Boolean,
+    ): Boolean {
+        var saved = false
+        actionMutex.withLock {
+            if (mutationsBlocked(allowWhileLoading)) return@withLock
+            val current = projection.timer ?: return@withLock
+            if (current.status !in activeStatuses) return@withLock
+            if (onlyIfExpired && current.id != local.ownedTimerId) return@withLock
+            if (onlyIfExpired && (
+                    current.status != TimerStatus.Running ||
+                        TimerReducer.elapsedAt(current) < current.plannedDurationMs
+                    )
+            ) return@withLock
+
+            val now = System.currentTimeMillis()
+            val finishWallMs = maxOf(now, local.hlcWallMs, 1L)
+            val finishCounter = if (finishWallMs == local.hlcWallMs) local.hlcCounter + 1 else 0
+            val finish = TimerCommand(
+                id = UUID.randomUUID().toString(),
+                deviceSequence = local.deviceSequence + 1,
+                timerId = current.id,
+                type = CommandType.Finish,
+                phase = current.phase,
+                plannedDurationMs = current.plannedDurationMs,
+                occurredAt = Instant.ofEpochMilli(now).toString(),
+                hlcWallMs = finishWallMs,
+                hlcCounter = finishCounter,
+                observedElapsedMs = TimerReducer.elapsedAt(current, now),
+            )
+            val commands = mutableListOf(finish)
+            val dependencies = mutableMapOf<String, String>()
+            dependencyForTimer(current.id)?.let { dependencies[finish.id] = it }
+            val finalWallMs = finishWallMs
+            var finalCounter = finishCounter
+            if (current.phase == TimerPhase.Focus &&
+                settings.autoStartBreaks &&
+                current.id == local.ownedTimerId
+            ) {
+                val completedFocusCount = TimerReducer.replay(
+                    canonicalTimer,
+                    canonicalHistory,
+                    pending + finish,
+                ).history.count {
+                    it.status == TimerStatus.Completed && it.phase == TimerPhase.Focus
+                }
+                val breakPhase = nextBreakPhase(completedFocusCount)
+                finalCounter += 1
+                val generatedStart = TimerCommand(
+                    id = UUID.randomUUID().toString(),
+                    deviceSequence = finish.deviceSequence + 1,
+                    timerId = UUID.randomUUID().toString(),
+                    type = CommandType.Start,
+                    phase = breakPhase,
+                    plannedDurationMs = settings.durationMsFor(breakPhase),
+                    occurredAt = Instant.ofEpochMilli(now).toString(),
+                    hlcWallMs = finalWallMs,
+                    hlcCounter = finalCounter,
+                    observedElapsedMs = 0,
+                )
+                commands += generatedStart
+                dependencies[generatedStart.id] = finish.id
+            }
+            val provisionalBreak = commands.lastOrNull()?.takeIf { it.type == CommandType.Start }
+            val nextLocal = local.copy(
+                deviceSequence = commands.last().deviceSequence,
+                hlcWallMs = finalWallMs,
+                hlcCounter = finalCounter,
+                ownedTimerId = provisionalBreak?.timerId ?: local.ownedTimerId,
+            )
+            dao.persistCommands(
+                commands.map { command ->
+                    PendingCommandEntity.from(command, dependencies[command.id])
+                },
+                nextLocal,
+            )
+            local = nextLocal
+            pending = pending + commands
+            commandDependencies = commandDependencies + dependencies
+            rebuildProjections()
+            publish()
+            scheduleAlarm()
+            saved = true
+        }
+        if (saved) requestSync()
+        return saved
     }
 
     private suspend fun issueCommand(type: String, startingPhase: String? = null): Boolean {
@@ -1110,10 +1302,15 @@ class TimerRepository(
                 deviceSequence = command.deviceSequence,
                 hlcWallMs = wallMs,
                 hlcCounter = counter,
+                ownedTimerId = timerId.takeIf { starting } ?: local.ownedTimerId,
             )
-            dao.persistCommand(PendingCommandEntity.from(command), nextLocal)
+            val dependency = if (starting) null else dependencyForTimer(command.timerId)
+            dao.persistCommand(PendingCommandEntity.from(command, dependency), nextLocal)
             local = nextLocal
             pending = pending + command
+            if (dependency != null) {
+                commandDependencies = commandDependencies + (command.id to dependency)
+            }
             rebuildProjections()
             publish()
             scheduleAlarm()
@@ -1174,14 +1371,87 @@ class TimerRepository(
         else -> false
     }
 
-    private fun nextBreakPhase(): String {
-        val completedFocus = projection.history.count {
-            it.status == TimerStatus.Completed && it.phase == TimerPhase.Focus
-        }
+    private fun nextBreakPhase(completedFocus: Int): String {
         return if (completedFocus > 0 && completedFocus % 4 == 0) {
             TimerPhase.LongBreak
         } else {
             TimerPhase.ShortBreak
+        }
+    }
+
+    private fun resolveGeneratedCommands(
+        sentCommands: List<TimerCommand>,
+        response: SyncResponse,
+        nextSettings: TimerSettings,
+    ): GeneratedCommandResolution {
+        val sentById = sentCommands.associateBy(TimerCommand::id)
+        val acknowledgements = response.acknowledgements.associateBy(Acknowledgement::commandId)
+        val groups = pending
+            .filter { it.id !in sentById && commandDependencies[it.id] in sentById }
+            .groupBy { requireNotNull(commandDependencies[it.id]) }
+        val released = mutableListOf<TimerCommand>()
+        val discarded = mutableListOf<TimerCommand>()
+        val discardedSourceTimerIds = mutableSetOf<String>()
+
+        groups.forEach { (sourceId, commands) ->
+            val source = sentById[sourceId]
+            val acknowledgement = acknowledgements[sourceId]
+            val generatedStart = commands.firstOrNull { it.type == CommandType.Start }
+            val canonicallyCompleted = source != null && (
+                response.history.any {
+                    it.timerId == source.timerId &&
+                        it.phase == TimerPhase.Focus &&
+                        it.status == TimerStatus.Completed
+                } || response.canonicalTimer?.let {
+                    it.id == source.timerId &&
+                        it.phase == TimerPhase.Focus &&
+                        it.status == TimerStatus.Completed
+                } == true
+                )
+            val accepted = source?.type == CommandType.Finish && (
+                acknowledgement?.outcome == "applied" ||
+                    acknowledgement?.outcome == "ignored" && canonicallyCompleted
+                )
+            val supersededByManualStart = generatedStart != null && pending.any { command ->
+                command.type == CommandType.Start &&
+                    command.id !in commandDependencies &&
+                    command.deviceSequence > generatedStart.deviceSequence
+            }
+
+            if (!accepted || generatedStart == null || supersededByManualStart) {
+                discarded += commands
+                if (!accepted && source != null) discardedSourceTimerIds += source.timerId
+                return@forEach
+            }
+
+            val completedFocusTimerIds = response.history.asSequence()
+                .filter { it.phase == TimerPhase.Focus && it.status == TimerStatus.Completed }
+                .map(HistoryItem::timerId)
+                .toMutableSet()
+            completedFocusTimerIds += source.timerId
+            val phase = nextBreakPhase(completedFocusTimerIds.size)
+            val durationMs = nextSettings.durationMsFor(phase)
+            released += commands.map { command ->
+                command.copy(
+                    phase = phase,
+                    plannedDurationMs = durationMs,
+                    observedElapsedMs = command.observedElapsedMs.coerceIn(0, durationMs),
+                )
+            }
+        }
+        return GeneratedCommandResolution(released, discarded, discardedSourceTimerIds)
+    }
+
+    private fun resolvedOwnedTimerId(
+        nextProjection: TimerProjection,
+        resolution: GeneratedCommandResolution,
+    ): String? {
+        val activeTimerId = nextProjection.timer
+            ?.takeIf { it.status in activeStatuses }
+            ?.id
+            ?: return null
+        return activeTimerId.takeIf {
+            it == local.ownedTimerId || it in resolution.discardedSourceTimerIds
         }
     }
 
@@ -1213,7 +1483,8 @@ class TimerRepository(
                 if (!forced &&
                     pending.isEmpty() &&
                     pendingTaskOperations.isEmpty() &&
-                    pendingDurationOperations.isEmpty()
+                    pendingDurationOperations.isEmpty() &&
+                    pendingAutoStartOperations.isEmpty()
                 ) {
                     retrying = false
                     publish()
@@ -1225,7 +1496,8 @@ class TimerRepository(
                     forced = false
                     if (pending.isEmpty() &&
                         pendingTaskOperations.isEmpty() &&
-                        pendingDurationOperations.isEmpty()
+                        pendingDurationOperations.isEmpty() &&
+                        pendingAutoStartOperations.isEmpty()
                     ) break
                 } catch (_: AuthenticationRequired) {
                     actionMutex.withLock {
@@ -1277,13 +1549,21 @@ class TimerRepository(
     private suspend fun syncOnce() {
         val attempt = actionMutex.withLock {
             if (historyResolution != null || accountSwitch != null) return
-            val sent = pending.take(MaxCommandsPerSync)
+            val sent = eligiblePendingCommands().asSequence()
+                .take(MaxCommandsPerSync)
+                .toList()
             val sentTaskOperations = pendingTaskOperations.take(MaxTaskOperationsPerSync)
             val sentDurationOperations = pendingDurationOperations
                 .sortedWith(durationOperationComparator)
                 .take(MaxDurationOperationsPerSync)
+            val sentAutoStartOperations = pendingAutoStartOperations
+                .sortedWith(autoStartOperationComparator)
+                .take(MaxAutoStartOperationsPerSync)
             if (sentDurationOperations.any { !it.isValidDurationOperation() }) {
                 throw SyncProtocolException("Queued duration operation is invalid")
+            }
+            if (sentAutoStartOperations.any { !it.isValidAutoStartOperation() }) {
+                throw SyncProtocolException("Queued auto-start operation is invalid")
             }
             syncing = true
             retrying = false
@@ -1296,6 +1576,7 @@ class TimerRepository(
                     commands = sent,
                     durationOperations = sentDurationOperations,
                     taskOperations = sentTaskOperations,
+                    autoStartOperations = sentAutoStartOperations,
                 ),
             )
         }
@@ -1321,18 +1602,26 @@ class TimerRepository(
                 response.durationAcknowledgements.map(DurationAcknowledgement::operationId),
                 "duration",
             )
+            val sentAutoStartOperationIds = validateAcknowledgements(
+                attempt.request.autoStartOperations.map(AutoStartOperation::id),
+                response.autoStartAcknowledgements.map(AutoStartAcknowledgement::operationId),
+                "auto-start",
+            )
             validateCanonicalResponse(response, "Sync")
             if (response.revision < local.revision) {
                 throw SyncProtocolException("Sync revision regressed from ${local.revision} to ${response.revision}")
             }
             val acknowledgedEntities = attempt.request.commands.map(PendingCommandEntity::from)
-            val nextPending = pending.filterNot { it.id in sentCommandIds }
             val acknowledgedTaskEntities = attempt.request.taskOperations
                 .map(PendingTaskOperationEntity::from)
             val nextPendingTaskOperations = pendingTaskOperations
                 .filterNot { it.id in sentTaskOperationIds }
             val nextPendingDurationOperations = pendingDurationOperations
                 .filterNot { it.id in sentDurationOperationIds }
+            val acknowledgedAutoStartEntities = attempt.request.autoStartOperations
+                .map(PendingAutoStartOperationEntity::from)
+            val nextPendingAutoStartOperations = pendingAutoStartOperations
+                .filterNot { it.id in sentAutoStartOperationIds }
             val nextCanonicalTimer = response.canonicalTimer
             val nextCanonicalHistory = response.history
             val nextCanonicalTasks = response.tasks
@@ -1341,7 +1630,30 @@ class TimerRepository(
             val nextSettings = replayDurationOperations(
                 settings.withDurations(response.durationsMs),
                 nextPendingDurationOperations,
+            ).copy(
+                autoStartBreaks = replayAutoStartOperations(
+                    response.autoStartBreaks,
+                    nextPendingAutoStartOperations,
+                ),
             )
+            val generatedResolution = resolveGeneratedCommands(
+                attempt.request.commands,
+                response,
+                nextSettings,
+            )
+            val discardedCommandIds = generatedResolution.discarded.map(TimerCommand::id).toSet()
+            val releasedCommandsById = generatedResolution.released.associateBy(TimerCommand::id)
+            val nextPending = pending
+                .filterNot { it.id in sentCommandIds || it.id in discardedCommandIds }
+                .map { releasedCommandsById[it.id] ?: it }
+            val nextCommandDependencies = commandDependencies -
+                (generatedResolution.released + generatedResolution.discarded).map(TimerCommand::id).toSet()
+            val nextProjection = TimerReducer.replay(
+                nextCanonicalTimer,
+                nextCanonicalHistory,
+                nextPending,
+            )
+            val nextOwnedTimerId = resolvedOwnedTimerId(nextProjection, generatedResolution)
             val (mergedWall, mergedCounter) = mergedClock(response)
             val nextLocal = local.copy(
                 revision = response.revision,
@@ -1355,19 +1667,29 @@ class TimerRepository(
                 settingsJson = json.encodeToString(nextSettings),
                 hlcWallMs = mergedWall,
                 hlcCounter = mergedCounter,
+                canonicalAutoStartBreaks = response.autoStartBreaks,
+                ownedTimerId = nextOwnedTimerId,
             )
             dao.applyFullSync(
-                acknowledgedEntities,
-                acknowledgedTaskEntities,
-                sentDurationOperationIds.toList(),
-                nextLocal,
+                acknowledgedCommands = acknowledgedEntities,
+                acknowledgedTaskOperations = acknowledgedTaskEntities,
+                acknowledgedDurationOperationIds = sentDurationOperationIds.toList(),
+                state = nextLocal,
+                acknowledgedAutoStartOperations = acknowledgedAutoStartEntities,
+                releasedCommands = generatedResolution.released.map(PendingCommandEntity::from),
+                discardedCommands = generatedResolution.discarded.map { command ->
+                    PendingCommandEntity.from(command, commandDependencies[command.id])
+                },
             )
             pending = nextPending
+            commandDependencies = nextCommandDependencies
             pendingTaskOperations = nextPendingTaskOperations
             pendingDurationOperations = nextPendingDurationOperations
+            pendingAutoStartOperations = nextPendingAutoStartOperations
             canonicalTimer = nextCanonicalTimer
             canonicalHistory = nextCanonicalHistory
             canonicalTasks = nextCanonicalTasks
+            canonicalAutoStartBreaks = response.autoStartBreaks
             knownTasks = nextKnownTasks
             settings = nextSettings
             local = nextLocal
@@ -1379,6 +1701,9 @@ class TimerRepository(
             }
             response.durationAcknowledgements.firstOrNull { it.outcome != "applied" }?.let {
                 conflict = it.reason.ifBlank { "Duration outcome: ${it.outcome}" }
+            }
+            response.autoStartAcknowledgements.firstOrNull { it.outcome != "applied" }?.let {
+                conflict = it.reason.ifBlank { "Auto-start outcome: ${it.outcome}" }
             }
             rebuildProjections()
             syncing = false
@@ -1509,8 +1834,17 @@ class TimerRepository(
     }
 
     private fun scheduleAlarm() {
-        alarmScheduler.update(projection.timer)
+        alarmScheduler.update(
+            projection.timer?.takeIf { it.id == local.ownedTimerId },
+        )
     }
+
+    private fun dependencyForTimer(timerId: String): String? = pending.firstNotNullOfOrNull { command ->
+        commandDependencies[command.id]?.takeIf { command.timerId == timerId }
+    }
+
+    private fun eligiblePendingCommands(): List<TimerCommand> =
+        pending.filter { it.id !in commandDependencies }
 
     private fun rebuildProjections() {
         projection = TimerReducer.replay(canonicalTimer, canonicalHistory, pending)
@@ -1539,10 +1873,28 @@ class TimerRepository(
             current.withDuration(operation.phase, operation.durationMs)
         }
 
+    private fun replayAutoStartOperations(
+        base: Boolean,
+        operations: List<AutoStartOperation>,
+    ): Boolean = operations
+        .asSequence()
+        .filter { it.isValidAutoStartOperation() }
+        .maxWithOrNull(autoStartOperationComparator)
+        ?.enabled
+        ?: base
+
     private fun DurationOperation.isValidDurationOperation(): Boolean =
         phase in TimerPhase.all &&
             DurationLimits.isValid(durationMs) &&
             ((hlcWallMs == 0L && hlcCounter == 0L) || (hlcWallMs > 0L && hlcCounter >= 0L))
+
+    private fun AutoStartOperation.isValidAutoStartOperation(): Boolean =
+        isUuid(id) &&
+            deviceId.isNotBlank() &&
+            deviceId == local.deviceId &&
+            hlcWallMs > 0L &&
+            hlcCounter >= 0L &&
+            parseInstant(occurredAt)
 
     private suspend fun fetchValidatedProfile(): User {
         val profile = try {
@@ -1593,6 +1945,9 @@ class TimerRepository(
         require(request.durationOperations.size <= MaxBootstrapOperations) {
             "Saved bootstrap duration operations exceed the 4096 item limit"
         }
+        require(request.autoStartOperations == null ||
+            request.autoStartOperations.size <= MaxBootstrapOperations
+        ) { "Saved bootstrap auto-start operations exceed the 4096 item limit" }
         require(request.commands.map(TimerCommand::id).toSet().size == request.commands.size) {
             "Saved bootstrap commands contain duplicate IDs"
         }
@@ -1606,9 +1961,15 @@ class TimerRepository(
             request.durationOperations.map(DurationOperation::id).toSet().size ==
                 request.durationOperations.size,
         ) { "Saved bootstrap duration operations contain duplicate IDs" }
+        require(
+            request.autoStartOperations == null ||
+                request.autoStartOperations.map(AutoStartOperation::id).toSet().size ==
+                request.autoStartOperations.size,
+        ) { "Saved bootstrap auto-start operations contain duplicate IDs" }
         request.commands.forEach(::validateTimerCommand)
         request.taskOperations.forEach(::validateTaskOperation)
         request.durationOperations.forEach(::validateDurationOperation)
+        request.autoStartOperations?.forEach(::validateAutoStartOperation)
     }
 
     private fun validateTimerCommand(command: TimerCommand) {
@@ -1672,17 +2033,49 @@ class TimerRepository(
         Instant.parse(operation.occurredAt)
     }
 
+    private fun validateAutoStartOperation(operation: AutoStartOperation) {
+        require(operation.isValidAutoStartOperation()) {
+            "Saved auto-start operation is invalid"
+        }
+    }
+
     private suspend fun applyBootstrapResolution(
         request: BootstrapResolutionRequest,
         response: SyncResponse,
     ) {
         val profile = user ?: throw AuthenticationRequired()
+        val retainedAutoStartOperations = if (request.autoStartOperations == null) {
+            pendingAutoStartOperations
+        } else {
+            emptyList()
+        }
         val nextKnownTasks = if (request.strategy == BootstrapStrategy.KeepRemote) {
             response.tasks.associateBy(FocusTask::id)
         } else {
             (knownTasks.values + response.tasks).associateBy(FocusTask::id)
         }
-        val nextSettings = settings.withDurations(response.durationsMs)
+        val nextSettings = settings.withDurations(response.durationsMs).copy(
+            autoStartBreaks = replayAutoStartOperations(
+                response.autoStartBreaks,
+                retainedAutoStartOperations,
+            ),
+        )
+        val generatedResolution = if (request.strategy == BootstrapStrategy.KeepRemote) {
+            GeneratedCommandResolution(emptyList(), emptyList(), emptySet())
+        } else {
+            resolveGeneratedCommands(request.commands, response, nextSettings)
+        }
+        val retainedCommands = generatedResolution.released
+        val nextProjection = TimerReducer.replay(
+            response.canonicalTimer,
+            response.history,
+            retainedCommands,
+        )
+        val nextOwnedTimerId = if (request.strategy == BootstrapStrategy.KeepRemote) {
+            null
+        } else {
+            resolvedOwnedTimerId(nextProjection, generatedResolution)
+        }
         val (mergedWall, mergedCounter) = mergedClock(response)
         val nextLocal = local.copy(
             revision = response.revision,
@@ -1698,16 +2091,25 @@ class TimerRepository(
             ownerUserId = profile.id,
             hlcWallMs = mergedWall,
             hlcCounter = mergedCounter,
+            canonicalAutoStartBreaks = response.autoStartBreaks,
+            ownedTimerId = nextOwnedTimerId,
         )
-        dao.applyBootstrapResolution(nextLocal)
+        dao.applyBootstrapResolution(
+            nextLocal,
+            clearAutoStartOperations = request.autoStartOperations != null,
+            retainedCommands = retainedCommands.map(PendingCommandEntity::from),
+        )
         local = nextLocal
-        pending = emptyList()
+        pending = retainedCommands
+        commandDependencies = emptyMap()
         pendingTaskOperations = emptyList()
         pendingDurationOperations = emptyList()
+        pendingAutoStartOperations = retainedAutoStartOperations
         pendingBootstrapResolution = null
         canonicalTimer = response.canonicalTimer
         canonicalHistory = response.history
         canonicalTasks = response.tasks
+        canonicalAutoStartBreaks = response.autoStartBreaks
         knownTasks = nextKnownTasks
         settings = nextSettings
         historyResolution = null
@@ -1722,6 +2124,9 @@ class TimerRepository(
         }
         response.durationAcknowledgements.firstOrNull { it.outcome != "applied" }?.let {
             conflict = it.reason.ifBlank { "Duration outcome: ${it.outcome}" }
+        }
+        response.autoStartAcknowledgements.firstOrNull { it.outcome != "applied" }?.let {
+            conflict = it.reason.ifBlank { "Auto-start outcome: ${it.outcome}" }
         }
         rebuildProjections()
         publish()
@@ -1741,6 +2146,7 @@ class TimerRepository(
                 response.acknowledgements.isNotEmpty() ||
                     response.taskAcknowledgements.isNotEmpty() ||
                     response.durationAcknowledgements.isNotEmpty()
+                    || response.autoStartAcknowledgements.isNotEmpty()
                 )
         ) {
             throw SyncProtocolException("$source returned acknowledgements for a read-only request")
@@ -1867,6 +2273,14 @@ class TimerRepository(
                 "duration",
             )
         }
+        response.autoStartAcknowledgements.forEach { acknowledgement ->
+            validateAcknowledgement(
+                acknowledgement.operationId,
+                acknowledgement.outcome,
+                source,
+                "auto-start",
+            )
+        }
     }
 
     private fun validateCanonicalTaskId(taskId: String, source: String) {
@@ -1913,12 +2327,13 @@ class TimerRepository(
             pending.isNotEmpty() ||
             pendingTaskOperations.isNotEmpty() ||
             pendingDurationOperations.isNotEmpty() ||
+            pendingAutoStartOperations.isNotEmpty() ||
             settings.effectiveDurationsMs() != DurationsMs()
 
-    private fun mutationsBlocked(): Boolean =
+    private fun mutationsBlocked(allowWhileLoading: Boolean = false): Boolean =
         historyResolution != null ||
             accountSwitch != null ||
-            authStatus == AuthStatus.Loading ||
+            (!allowWhileLoading && authStatus == AuthStatus.Loading) ||
             authStatus == AuthStatus.SigningIn
 
     private fun PendingBootstrapResolutionEntity.toRequestStrict(): BootstrapResolutionRequest {
@@ -1934,23 +2349,37 @@ class TimerRepository(
             commands = strictJson.decodeFromString(commandsJson),
             taskOperations = strictJson.decodeFromString(taskOperationsJson),
             durationOperations = strictJson.decodeFromString(durationOperationsJson),
+            autoStartOperations = autoStartOperationsJson?.let {
+                strictJson.decodeFromString<List<AutoStartOperation>>(it)
+            },
         )
         validateResolutionEnvelope(request)
-        validateResolutionQueues(request)
+        validateResolutionQueues(
+            request,
+            allowLegacyFullCommandQueue = autoStartOperationsJson == null,
+        )
         return request
     }
 
-    private fun validateResolutionQueues(request: BootstrapResolutionRequest) {
+    private fun validateResolutionQueues(
+        request: BootstrapResolutionRequest,
+        allowLegacyFullCommandQueue: Boolean,
+    ) {
         if (request.strategy == BootstrapStrategy.KeepRemote) {
             require(
                 request.commands.isEmpty() &&
                     request.taskOperations.isEmpty() &&
-                    request.durationOperations.isEmpty(),
+                    request.durationOperations.isEmpty() &&
+                    request.autoStartOperations.orEmpty().isEmpty(),
             ) { "Saved Keep Remote request contains local operations" }
             return
         }
-        require(request.commands.sortedBy(TimerCommand::deviceSequence) ==
-            pending.sortedBy(TimerCommand::deviceSequence)
+        val requestedCommands = request.commands.sortedBy(TimerCommand::deviceSequence)
+        val eligibleCommands = eligiblePendingCommands().sortedBy(TimerCommand::deviceSequence)
+        val allCommands = pending.sortedBy(TimerCommand::deviceSequence)
+        require(
+            requestedCommands == eligibleCommands ||
+                allowLegacyFullCommandQueue && requestedCommands == allCommands,
         ) { "Saved bootstrap commands do not match local queues" }
         require(request.taskOperations.sortedWith(taskOperationComparator) ==
             pendingTaskOperations.sortedWith(taskOperationComparator)
@@ -1958,6 +2387,11 @@ class TimerRepository(
         require(request.durationOperations.sortedWith(durationOperationComparator) ==
             pendingDurationOperations.sortedWith(durationOperationComparator)
         ) { "Saved bootstrap duration operations do not match local queues" }
+        if (request.autoStartOperations != null) {
+            require(request.autoStartOperations.sortedWith(autoStartOperationComparator) ==
+                pendingAutoStartOperations.sortedWith(autoStartOperationComparator)
+            ) { "Saved bootstrap auto-start operations do not match local queues" }
+        }
     }
 
     private fun BootstrapResolutionRequest.toEntity(profile: User) = PendingBootstrapResolutionEntity(
@@ -1968,6 +2402,7 @@ class TimerRepository(
         commandsJson = json.encodeToString(commands),
         taskOperationsJson = json.encodeToString(taskOperations),
         durationOperationsJson = json.encodeToString(durationOperations),
+        autoStartOperationsJson = autoStartOperations?.let(json::encodeToString),
         ownerUserId = profile.id,
         userJson = json.encodeToString(profile),
     )
@@ -2043,7 +2478,8 @@ class TimerRepository(
             retrying -> SyncStatus.Retrying
             pending.isNotEmpty() ||
                 pendingTaskOperations.isNotEmpty() ||
-                pendingDurationOperations.isNotEmpty() -> SyncStatus.Queued
+                pendingDurationOperations.isNotEmpty() ||
+                pendingAutoStartOperations.isNotEmpty() -> SyncStatus.Queued
             !initialized.isCompleted -> SyncStatus.Checking
             else -> SyncStatus.Synced
         }
@@ -2058,7 +2494,8 @@ class TimerRepository(
             taskSummaries = TaskReducer.summariesToday(tasks, projection.history),
             selectedTaskId = if (::local.isInitialized) local.selectedTaskId else null,
             settings = settings,
-            pendingCount = pending.size + pendingTaskOperations.size + pendingDurationOperations.size,
+            pendingCount = pending.size + pendingTaskOperations.size + pendingDurationOperations.size +
+                pendingAutoStartOperations.size,
             syncStatus = syncStatus,
             historyResolution = historyResolution,
             accountSwitch = accountSwitch,
@@ -2075,6 +2512,7 @@ class TimerRepository(
         const val MaxCommandsPerSync = 256
         const val MaxTaskOperationsPerSync = 256
         const val MaxDurationOperationsPerSync = 256
+        const val MaxAutoStartOperationsPerSync = 256
         const val MaxBootstrapOperations = 4096
         const val MaxTimerDurationMs = 14_400_000L
         val commandTypes = setOf(
@@ -2094,6 +2532,12 @@ class TimerRepository(
             TaskOperation::hlcWallMs,
             TaskOperation::hlcCounter,
             TaskOperation::id,
+        )
+        val autoStartOperationComparator = compareBy<AutoStartOperation>(
+            AutoStartOperation::hlcWallMs,
+            AutoStartOperation::hlcCounter,
+            AutoStartOperation::deviceId,
+            AutoStartOperation::id,
         )
         val activeStatuses = setOf(TimerStatus.Running, TimerStatus.Paused)
         val timerStatuses = activeStatuses + setOf(

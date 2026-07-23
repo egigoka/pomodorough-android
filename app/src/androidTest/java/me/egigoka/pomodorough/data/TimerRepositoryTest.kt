@@ -90,7 +90,7 @@ class TimerRepositoryTest {
         assertTrue(repository.state.value.tasks.isEmpty())
         assertEquals(DurationsMs(), repository.state.value.settings.effectiveDurationsMs())
         assertEquals(TimerPhase.LongBreak, repository.state.value.settings.selectedPhase)
-        assertTrue(repository.state.value.settings.autoStartBreaks)
+        assertTrue(!repository.state.value.settings.autoStartBreaks)
     }
 
     @Test
